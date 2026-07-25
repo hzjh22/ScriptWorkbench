@@ -1,0 +1,10 @@
+{
+  "framework": "click",
+  "source": "ast",
+  "parameters": {
+    "input_file": "file",
+    "verbose": "boolean",
+    "token": "secret",
+    "quality": "choice"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "framework": "sidecar",
+  "source": "sidecar",
+  "parameters": {
+    "serial": "text"
+  }
+}

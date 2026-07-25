@@ -1,0 +1,8 @@
+{
+  "framework": "unknown",
+  "source": "ast",
+  "parameters": {
+    "from_help": "text",
+    "switch": "boolean"
+  }
+}

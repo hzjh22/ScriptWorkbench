@@ -1,0 +1,42 @@
+{
+  "taskName": "Sidecar task",
+  "description": "Manifest takes precedence",
+  "framework": "sidecar",
+  "groups": [{ "id": "common", "label": "常用参数", "advanced": false }],
+  "parameters": [
+    {
+      "name": "serial",
+      "label": "Serial",
+      "description": "From manifest",
+      "type": "text",
+      "required": true,
+      "defaultValue": "",
+      "options": [],
+      "min": null,
+      "max": null,
+      "group": "常用参数",
+      "advanced": false,
+      "source": "sidecar",
+      "confidence": "high",
+      "locked": false,
+      "condition": null,
+      "derivedTemplate": null,
+      "allowOverride": true,
+      "enabled": true
+    }
+  ],
+  "argumentRules": [
+    {
+      "id": "serial",
+      "inputName": "serial",
+      "flag": "--serial",
+      "emission": "always",
+      "valueTemplate": "{{serial}}",
+      "condition": null,
+      "enabled": true
+    }
+  ],
+  "validationRules": [],
+  "relationshipCandidates": [],
+  "diagnostics": []
+}

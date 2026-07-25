@@ -1,0 +1,9 @@
+{
+  "framework": "typer",
+  "source": "ast",
+  "parameters": {
+    "input_html": "file",
+    "timeout": "number",
+    "browser_fallback": "boolean"
+  }
+}

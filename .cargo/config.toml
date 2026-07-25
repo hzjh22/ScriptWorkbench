@@ -1,0 +1,8 @@
+[target.x86_64-pc-windows-gnullvm]
+linker = "E:/ScriptWorkbench/toolchains/llvm-mingw-20260616-ucrt-x86_64/bin/clang.exe"
+ar = "E:/ScriptWorkbench/toolchains/llvm-mingw-20260616-ucrt-x86_64/bin/llvm-ar.exe"
+
+[env]
+CC = "E:/ScriptWorkbench/toolchains/llvm-mingw-20260616-ucrt-x86_64/bin/clang.exe"
+CXX = "E:/ScriptWorkbench/toolchains/llvm-mingw-20260616-ucrt-x86_64/bin/clang++.exe"
+AR = "E:/ScriptWorkbench/toolchains/llvm-mingw-20260616-ucrt-x86_64/bin/llvm-ar.exe"

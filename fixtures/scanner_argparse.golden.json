@@ -1,0 +1,14 @@
+{
+  "framework": "argparse",
+  "source": "ast",
+  "parameters": {
+    "book_url": "text",
+    "output": "directory",
+    "chapters": "text",
+    "workers": "choice",
+    "quiet_pages": "boolean",
+    "header": "text",
+    "direct": "boolean",
+    "proxy": "text"
+  }
+}
