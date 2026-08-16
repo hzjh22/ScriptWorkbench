@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -14,6 +15,7 @@ import {
   resolveTaskWorkingDirectory, taskMatchesSearch,
 } from "./lib/taskUtils";
 import {
+  runtimeValuesAfterChange,
   runtimeValuesWithDefaults,
   syncRuntimeParameters,
   validateRuntimeValues,
@@ -53,6 +55,85 @@ const DEFAULT_SETTINGS: AppSettings = {
   autoSaveEditor: false,
   confirmBeforeStop: true,
 };
+
+type QrImageInfo = {
+  primaryPath: string;
+  latestPath: string | null;
+};
+
+const QR_IMAGE_PATH_RE = /[A-Za-z]:[\\/][^\r\n'"),]+?\.png/gi;
+
+function normalizeQrPath(path: string): string {
+  return path.replace(/\//g, "\\");
+}
+
+function firstQrPath(line: string): string | null {
+  const matches = line.match(QR_IMAGE_PATH_RE);
+  return matches?.[0] ? normalizeQrPath(matches[0]) : null;
+}
+
+function extractLatestQrImage(output: string): QrImageInfo | null {
+  let primaryPath: string | null = null;
+  let latestPath: string | null = null;
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.startsWith("QR image:")) {
+      primaryPath = firstQrPath(line) ?? primaryPath;
+    } else if (line.startsWith("QR latest image:")) {
+      latestPath = firstQrPath(line) ?? latestPath;
+    }
+  }
+  if (!primaryPath && !latestPath) return null;
+  return { primaryPath: primaryPath ?? latestPath!, latestPath };
+}
+
+function fileSrcForPreview(path: string): string {
+  try {
+    return convertFileSrc(path);
+  } catch {
+    return `file:///${path.replace(/\\/g, "/")}`;
+  }
+}
+
+function TerminalOutputView({
+  output,
+  emptyText,
+  stream,
+}: {
+  output: string;
+  emptyText: string;
+  stream: "stdout" | "stderr";
+}) {
+  const qrImage = stream === "stdout" ? extractLatestQrImage(output) : null;
+  return (
+    <div className={`terminal-output-wrap ${stream}`}>
+      {qrImage && (
+        <div className="qr-preview-card">
+          <div className="qr-preview-copy">
+            <strong>Telegram 登录二维码</strong>
+            <span>请用手机 Telegram：设置 → 设备 → 连接桌面设备，然后扫描下方二维码并确认登录。</span>
+            <code>{qrImage.primaryPath}</code>
+          </div>
+          <div className="qr-preview-actions">
+            <img
+              className="qr-preview-image"
+              src={fileSrcForPreview(qrImage.primaryPath)}
+              alt="Telegram 登录二维码"
+            />
+            <button
+              type="button"
+              className="secondary-button compact-button"
+              onClick={() => void openPath(qrImage.primaryPath)}
+            >
+              打开二维码图片
+            </button>
+          </div>
+        </div>
+      )}
+      <pre className={`terminal-output ${stream}`}>{output || emptyText}</pre>
+    </div>
+  );
+}
 const WORKSPACE_BACKUP_VERSION = 4;
 
 function App() {
@@ -94,6 +175,7 @@ function App() {
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [runSearch, setRunSearch] = useState("");
   const [runStatusFilter, setRunStatusFilter] = useState("all");
+  const [isClearingRunHistory, setIsClearingRunHistory] = useState(false);
   const [scriptScanPreview, setScriptScanPreview] = useState<ScriptScanPreview | null>(null);
   const [scriptScanBusy, setScriptScanBusy] = useState(false);
   const [scriptScanStatus, setScriptScanStatus] = useState<ScriptScanStatus | null>(null);
@@ -232,6 +314,57 @@ function App() {
     rememberLatestTaskRuns(runList);
     if (!selectedRunId && runList[0]) {
       setSelectedRunId(runList[0].id);
+    }
+  }
+
+  async function handleClearRunHistory() {
+    const historyCount = runs.filter((run) => run.status !== "running").length;
+    if (historyCount === 0) {
+      flashStatus("没有可清除的历史运行记录");
+      return;
+    }
+    const runningCount = runs.length - historyCount;
+    const runningNotice = runningCount > 0
+      ? `\n\n当前有 ${runningCount} 个运行中实例，它们不会被停止或清除。`
+      : "";
+    if (!window.confirm(
+      `确定清除 ${historyCount} 条历史运行记录及其日志吗？此操作不可撤销。${runningNotice}`,
+    )) {
+      return;
+    }
+
+    setIsClearingRunHistory(true);
+    try {
+      const result = await api.clearRunHistory();
+      const remainingRuns = await api.listRuns();
+      const remainingIds = new Set(remainingRuns.map((run) => run.id));
+      const nextActiveRunByTask: Record<string, string> = {};
+      for (const run of remainingRuns) {
+        if (run.taskId && !nextActiveRunByTask[run.taskId]) {
+          nextActiveRunByTask[run.taskId] = run.id;
+        }
+      }
+
+      setRuns(remainingRuns);
+      setSelectedRunId((current) =>
+        current && remainingIds.has(current) ? current : remainingRuns[0]?.id ?? null,
+      );
+      setSelectedRunSnapshot(null);
+      setTerminalBuffers((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(([runId]) => remainingIds.has(runId)),
+        ),
+      );
+      setActiveRunByTask(nextActiveRunByTask);
+
+      const logWarning = result.failedLogCount > 0
+        ? `；${result.failedLogCount} 个日志文件未能删除`
+        : "";
+      flashStatus(`已清除 ${result.deletedCount} 条历史运行记录${logWarning}`);
+    } catch (error) {
+      setStatusMessage(`清除运行记录失败: ${String(error)}`);
+    } finally {
+      setIsClearingRunHistory(false);
     }
   }
 
@@ -794,10 +927,17 @@ function App() {
 
   function handleRuntimeValueChange(name: string, value: string) {
     setRuntimeValues((current) => {
-      const next = { ...current, [name]: value };
+      let next = runtimeValuesAfterChange(runtimeParameters, current, name, value);
       if (name === "watch_url") {
         const match = value.match(/[?&]v=([^&#]+)/i);
-        if (match) next.video_id = decodeURIComponent(match[1]);
+        if (match) {
+          next = runtimeValuesAfterChange(
+            runtimeParameters,
+            next,
+            "video_id",
+            decodeURIComponent(match[1]),
+          );
+        }
       }
       return next;
     });
@@ -1879,9 +2019,11 @@ function App() {
                         <div className="terminal-grid">
                           <div>
                             <h4>Stdout</h4>
-                            <pre className="terminal-output stdout">
-                              {activeTerminal?.stdout || "等待输出..."}
-                            </pre>
+                            <TerminalOutputView
+                              stream="stdout"
+                              output={activeTerminal?.stdout ?? ""}
+                              emptyText="等待输出..."
+                            />
                           </div>
                           <div>
                             <h4>
@@ -1889,9 +2031,11 @@ function App() {
                                 ? "进程信息（stderr）"
                                 : "错误与进程信息（stderr）"}
                             </h4>
-                            <pre className="terminal-output stderr">
-                              {activeTerminal?.stderr || "暂无进程信息。"}
-                            </pre>
+                            <TerminalOutputView
+                              stream="stderr"
+                              output={activeTerminal?.stderr ?? ""}
+                              emptyText="暂无进程信息。"
+                            />
                           </div>
                         </div>
                       </>
@@ -1914,30 +2058,43 @@ function App() {
                       <h3>运行记录</h3>
                       <p className="muted">按任务名、命令和状态搜索历史运行。</p>
                     </div>
-                    <button className="ghost-button" onClick={() => void refreshRuns()}>
-                      刷新列表
-                    </button>
+                    <div className="panel-actions">
+                      <button className="ghost-button" onClick={() => void refreshRuns()}>
+                        刷新列表
+                      </button>
+                      <button
+                        className="ghost-button danger"
+                        disabled={
+                          isClearingRunHistory ||
+                          !runs.some((run) => run.status !== "running")
+                        }
+                        onClick={() => void handleClearRunHistory()}
+                      >
+                        {isClearingRunHistory ? "正在清除..." : "一键清除历史"}
+                      </button>
+                    </div>
                   </div>
-                  <div className="filter-grid">
+                  <div className="filter-grid run-filter-grid">
                     <input
                       className="text-input compact"
                       value={runSearch}
                       placeholder="搜索任务、命令或目录"
                       onChange={(event) => setRunSearch(event.currentTarget.value)}
                     />
-                    <ChoiceField
+                    <select
+                      className="text-input compact run-status-select"
+                      aria-label="运行状态筛选"
                       value={runStatusFilter}
-                      options={[
-                        { value: "all", label: "全部状态" },
-                        { value: "running", label: "running" },
-                        { value: "finished", label: "finished" },
-                        { value: "failed", label: "failed" },
-                        { value: "stopped", label: "stopped" },
-                        { value: "timed_out", label: "timed_out" },
-                        { value: "interrupted", label: "interrupted" },
-                      ]}
-                      onChange={setRunStatusFilter}
-                    />
+                      onChange={(event) => setRunStatusFilter(event.currentTarget.value)}
+                    >
+                      <option value="all">全部状态</option>
+                      <option value="running">running</option>
+                      <option value="finished">finished</option>
+                      <option value="failed">failed</option>
+                      <option value="stopped">stopped</option>
+                      <option value="timed_out">timed_out</option>
+                      <option value="interrupted">interrupted</option>
+                    </select>
                   </div>
                   <div className="table-list">
                     {visibleRuns.map((run) => (
@@ -2068,14 +2225,14 @@ function App() {
                         <span>命令快照</span>
                         <pre className="command-preview">{selectedRun.commandPreview}</pre>
                       </label>
-                      <div className="terminal-grid">
+                      <div className="terminal-grid run-record-terminal-grid">
                         <div>
                           <h4>Stdout</h4>
-                          <pre className="terminal-output stdout">
-                            {runOutputLoading
-                              ? "加载中..."
-                              : selectedRunSnapshot?.stdout || "暂无输出。"}
-                          </pre>
+                          <TerminalOutputView
+                            stream="stdout"
+                            output={runOutputLoading ? "加载中..." : selectedRunSnapshot?.stdout ?? ""}
+                            emptyText="暂无输出。"
+                          />
                         </div>
                         <div>
                           <h4>
@@ -2083,11 +2240,11 @@ function App() {
                               ? "进程信息（stderr）"
                               : "错误与进程信息（stderr）"}
                           </h4>
-                          <pre className="terminal-output stderr">
-                            {runOutputLoading
-                              ? "加载中..."
-                              : selectedRunSnapshot?.stderr || "暂无进程信息。"}
-                          </pre>
+                          <TerminalOutputView
+                            stream="stderr"
+                            output={runOutputLoading ? "加载中..." : selectedRunSnapshot?.stderr ?? ""}
+                            emptyText="暂无进程信息。"
+                          />
                         </div>
                       </div>
                     </>

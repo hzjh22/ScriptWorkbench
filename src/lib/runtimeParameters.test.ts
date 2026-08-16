@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { RuntimeParameterDefinition } from "../types";
 import {
+  runtimeValuesAfterChange,
   runtimeValuesWithDerived,
+  runtimeValuesWithDefaults,
   syncRuntimeParameters,
   validateRuntimeValues,
 } from "./runtimeParameters";
@@ -105,5 +107,80 @@ describe("dynamic runtime parameters", () => {
     });
     expect(validateRuntimeValues(parameters, { source_mode: "id" })).toEqual({});
     expect(validateRuntimeValues(parameters, { source_mode: "html" })).toHaveProperty("input_html");
+  });
+
+  it("refreshes previously auto-derived fields when their source identifier changes", () => {
+    const parameters: RuntimeParameterDefinition[] = [
+      {
+        ...syncRuntimeParameters("{{book_id}}", [])[0],
+        label: "漫画 ID",
+      },
+      {
+        ...syncRuntimeParameters("{{book_url}}", [])[0],
+        label: "漫画地址",
+        derivedTemplate: "https://www.comicbox.xyz/book/{{book_id}}",
+        allowOverride: false,
+      },
+      {
+        ...syncRuntimeParameters("{{output}}", [])[0],
+        label: "输出目录",
+        type: "directory",
+        derivedTemplate: "C:/Scripts/conmic/comicbox_{{book_id}}_backup",
+        allowOverride: true,
+      },
+    ];
+
+    const updated = runtimeValuesAfterChange(
+      parameters,
+      {
+        book_id: "5487",
+        book_url: "https://www.comicbox.xyz/book/5487",
+        output: "C:/Scripts/conmic/comicbox_5487_backup",
+      },
+      "book_id",
+      "4683",
+    );
+
+    expect(updated).toMatchObject({
+      book_id: "4683",
+      book_url: "https://www.comicbox.xyz/book/4683",
+      output: "C:/Scripts/conmic/comicbox_4683_backup",
+    });
+
+    const withCustomOutput = runtimeValuesAfterChange(
+      parameters,
+      {
+        book_id: "5487",
+        book_url: "https://www.comicbox.xyz/book/5487",
+        output: "D:/custom/comicbox",
+      },
+      "book_id",
+      "4683",
+    );
+
+    expect(withCustomOutput.output).toBe("D:/custom/comicbox");
+  });
+
+  it("repairs stale auto-derived paths loaded from previous runs", () => {
+    const parameters: RuntimeParameterDefinition[] = [
+      {
+        ...syncRuntimeParameters("{{book_id}}", [])[0],
+        label: "漫画 ID",
+      },
+      {
+        ...syncRuntimeParameters("{{output}}", [])[0],
+        label: "输出目录",
+        type: "directory",
+        derivedTemplate: "C:\\Scripts\\conmic\\comicbox_{{book_id}}_backup",
+        allowOverride: true,
+      },
+    ];
+
+    const values = runtimeValuesWithDefaults(parameters, {
+      book_id: "4683",
+      output: "C:\\Scripts\\conmic\\comicbox_5487_backup",
+    });
+
+    expect(values.output).toBe("C:\\Scripts\\conmic\\comicbox_4683_backup");
   });
 });

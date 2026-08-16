@@ -15,12 +15,14 @@ dist-ssr
 # Rust / Tauri build output
 target/
 src-tauri/target/
+src-tauri/target-updated/
 
 # Local build and regression artifacts
 artifacts/
 toolchains/
 llvm-mingw*.zip
 rustup-init*.exe
+*.bak
 
 # Python caches and local environments
 __pycache__/

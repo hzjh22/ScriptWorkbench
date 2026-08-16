@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   AppSettings,
   BundledPythonStatus,
+  ClearRunHistoryResult,
   CommandImportResult,
   InterpreterHealth,
   InterpreterProfile,
@@ -47,6 +48,8 @@ export const api = {
   }),
 
   listRuns: () => invoke<RunRecord[]>("list_runs"),
+  clearRunHistory: () =>
+    invoke<ClearRunHistoryResult>("clear_run_history"),
   getRunOutput: (runId: string) =>
     invoke<RunOutput>("read_run_output", { runId }),
   getTaskRuntimeValues: (taskId: string) =>

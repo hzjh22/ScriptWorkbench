@@ -18,6 +18,8 @@ const {
   scanPythonScriptMock,
   checkScriptScanStatusMock,
   pickFileMock,
+  listRunsMock,
+  clearRunHistoryMock,
 } = vi.hoisted(() => ({
   startRunMock: vi.fn(),
   writeTextFileMock: vi.fn(),
@@ -30,6 +32,8 @@ const {
   scanPythonScriptMock: vi.fn(),
   checkScriptScanStatusMock: vi.fn(),
   pickFileMock: vi.fn(),
+  listRunsMock: vi.fn(),
+  clearRunHistoryMock: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -144,7 +148,8 @@ vi.mock("./lib/api", () => ({
         command: null,
       },
     ]),
-    listRuns: vi.fn(async () => []),
+    listRuns: listRunsMock,
+    clearRunHistory: clearRunHistoryMock,
     listInterpreterProfiles: vi.fn(async () => [
       {
         id: "system-python",
@@ -248,6 +253,14 @@ describe("App selftest interactions", () => {
     dialogSaveMock.mockImplementation(async () => "E:/export.json");
     pickFileMock.mockReset();
     pickFileMock.mockImplementation(async () => null);
+    listRunsMock.mockReset();
+    listRunsMock.mockImplementation(async () => []);
+    clearRunHistoryMock.mockReset();
+    clearRunHistoryMock.mockImplementation(async () => ({
+      deletedCount: 0,
+      deletedLogCount: 0,
+      failedLogCount: 0,
+    }));
     checkScriptScanStatusMock.mockReset();
     checkScriptScanStatusMock.mockImplementation(async () => ({
       status: "unchanged",
@@ -538,6 +551,57 @@ describe("App selftest interactions", () => {
 
     expect(readTextFileMock).toHaveBeenCalledWith("E:/import.json");
     expect(saveSettingsMock).toHaveBeenCalled();
+  });
+
+  it("clears completed run history while preserving running instances", async () => {
+    const user = userEvent.setup();
+    const completedRun = {
+      id: "run-finished",
+      taskId: "task-1",
+      taskName: "Completed Task",
+      status: "finished",
+      commandPreview: "python completed.py",
+      workingDirectory: "E:/ScriptWorkbench",
+      startedAt: "2026-01-01T00:00:00",
+      finishedAt: "2026-01-01T00:00:01",
+      durationMs: 1000,
+      exitCode: 0,
+      stdoutLogPath: "finished-stdout.log",
+      stderrLogPath: "finished-stderr.log",
+      runtimeValues: {},
+      attemptCount: 1,
+      terminationReason: null,
+    };
+    const runningRun = {
+      ...completedRun,
+      id: "run-active",
+      taskName: "Active Task",
+      status: "running",
+      finishedAt: null,
+      durationMs: null,
+      exitCode: null,
+    };
+    listRunsMock
+      .mockResolvedValueOnce([completedRun, runningRun])
+      .mockResolvedValue([runningRun]);
+    clearRunHistoryMock.mockResolvedValue({
+      deletedCount: 1,
+      deletedLogCount: 2,
+      failedLogCount: 0,
+    });
+    vi.spyOn(window, "confirm").mockReturnValueOnce(true);
+    render(<App />);
+
+    await screen.findByText("UI Selftest Task");
+    await user.click(screen.getByRole("button", { name: "运行记录" }));
+    await screen.findAllByText("Completed Task");
+    expect(screen.getByRole("combobox", { name: "运行状态筛选" }))
+      .toHaveProperty("value", "all");
+    await user.click(screen.getByRole("button", { name: "一键清除历史" }));
+
+    await waitFor(() => expect(clearRunHistoryMock).toHaveBeenCalledTimes(1));
+    expect(screen.queryAllByText("Completed Task")).toHaveLength(0);
+    expect((await screen.findAllByText("Active Task")).length).toBeGreaterThan(0);
   });
 
   it("toggles favorite and settings switches without crashing", async () => {

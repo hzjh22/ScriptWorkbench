@@ -263,6 +263,14 @@ struct RunStatusEvent {
     duration_ms: Option<i64>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearRunHistoryResult {
+    deleted_count: usize,
+    deleted_log_count: usize,
+    failed_log_count: usize,
+}
+
 #[derive(Clone)]
 struct PreparedCommand {
     program: String,
@@ -291,6 +299,7 @@ pub fn run() {
             check_script_scan_status,
             import_command,
             list_runs,
+            clear_run_history,
             read_run_output,
             get_task_runtime_values,
             start_run,
@@ -2062,6 +2071,60 @@ fn list_runs(state: State<'_, AppState>) -> Result<Vec<RunRecord>, String> {
         .map_err(|err| err.to_string())
 }
 
+fn delete_completed_run_records(conn: &Connection) -> anyhow::Result<(usize, Vec<PathBuf>)> {
+    let transaction = conn.unchecked_transaction()?;
+    let log_paths = {
+        let mut statement = transaction.prepare(
+            "SELECT stdout_log_path, stderr_log_path FROM run_records WHERE status <> 'running'",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut paths = Vec::new();
+        for row in rows {
+            let (stdout_path, stderr_path) = row?;
+            paths.push(PathBuf::from(stdout_path));
+            paths.push(PathBuf::from(stderr_path));
+        }
+        paths
+    };
+    let deleted_count =
+        transaction.execute("DELETE FROM run_records WHERE status <> 'running'", [])?;
+    transaction.commit()?;
+    Ok((deleted_count, log_paths))
+}
+
+#[tauri::command]
+fn clear_run_history(state: State<'_, AppState>) -> Result<ClearRunHistoryResult, String> {
+    let conn = open_connection(&state).map_err(|err| err.to_string())?;
+    let (deleted_count, log_paths) =
+        delete_completed_run_records(&conn).map_err(|err| err.to_string())?;
+    let mut deleted_log_count = 0;
+    let mut failed_log_count = 0;
+    let mut unique_paths = HashSet::new();
+
+    for path in log_paths {
+        if !unique_paths.insert(path.clone()) {
+            continue;
+        }
+        if path.parent() != Some(state.log_dir.as_path()) {
+            failed_log_count += 1;
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => deleted_log_count += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => failed_log_count += 1,
+        }
+    }
+
+    Ok(ClearRunHistoryResult {
+        deleted_count,
+        deleted_log_count,
+        failed_log_count,
+    })
+}
+
 #[tauri::command]
 fn read_run_output(state: State<'_, AppState>, run_id: String) -> Result<RunOutput, String> {
     let conn = open_connection(&state).map_err(|err| err.to_string())?;
@@ -3023,6 +3086,35 @@ mod tests {
             .any(|argument| argument == "top-secret"));
         assert!(!prepared.preview.contains("top-secret"));
         assert!(prepared.preview.contains("••••••••"));
+    }
+
+    #[test]
+    fn clearing_run_history_keeps_running_records() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE run_records (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                stdout_log_path TEXT NOT NULL,
+                stderr_log_path TEXT NOT NULL
+            );
+            INSERT INTO run_records VALUES
+                ('finished', 'finished', 'finished-out.log', 'finished-err.log'),
+                ('failed', 'failed', 'failed-out.log', 'failed-err.log'),
+                ('active', 'running', 'active-out.log', 'active-err.log');",
+        )
+        .unwrap();
+
+        let (deleted_count, log_paths) = delete_completed_run_records(&conn).unwrap();
+
+        assert_eq!(deleted_count, 2);
+        assert_eq!(log_paths.len(), 4);
+        let remaining = conn
+            .query_row("SELECT id FROM run_records", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, "active");
     }
 
     #[tokio::test]

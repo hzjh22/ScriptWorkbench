@@ -93,6 +93,19 @@ function interpolate(template: string, values: RuntimeValues): string {
   ));
 }
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function matchesDerivedTemplateShape(template: string, value: string): boolean {
+  if (!/\{\{[A-Za-z_][A-Za-z0-9_]*\}\}/.test(template)) return false;
+  const pattern = `^${template
+    .split(/\{\{[A-Za-z_][A-Za-z0-9_]*\}\}/)
+    .map(escapeRegExp)
+    .join(".+")}$`;
+  return new RegExp(pattern).test(value);
+}
+
 export function conditionMatches(
   condition: ArgumentCondition | null | undefined,
   values: RuntimeValues,
@@ -134,16 +147,74 @@ export function runtimeValuesWithDerived(
   return values;
 }
 
+function shouldRefreshDerivedValue(
+  parameters: RuntimeParameterDefinition[],
+  currentValues: RuntimeValues,
+  parameter: RuntimeParameterDefinition,
+): boolean {
+  const template = parameter.derivedTemplate;
+  if (!template) return false;
+  if (parameter.allowOverride === false) return true;
+
+  const currentValue = currentValues[parameter.name] ?? "";
+  if (!currentValue.trim()) return true;
+
+  const previousAutoValues = runtimeValuesWithDerived(parameters, {
+    ...currentValues,
+    [parameter.name]: "",
+  });
+  if (currentValue === (previousAutoValues[parameter.name] ?? "")) return true;
+
+  return matchesDerivedTemplateShape(template, currentValue);
+}
+
+function syncAutoDerivedValues(
+  parameters: RuntimeParameterDefinition[],
+  values: RuntimeValues,
+  skippedName?: string,
+): RuntimeValues {
+  const autoDerivedNames = parameters
+    .filter((parameter) => parameter.name !== skippedName)
+    .filter((parameter) => shouldRefreshDerivedValue(parameters, values, parameter))
+    .map((parameter) => parameter.name);
+  if (autoDerivedNames.length === 0) return values;
+
+  const valuesForDerivation = { ...values };
+  for (const name of autoDerivedNames) {
+    valuesForDerivation[name] = "";
+  }
+  const nextResolvedValues = runtimeValuesWithDerived(parameters, valuesForDerivation);
+  const nextValues = { ...values };
+  for (const name of autoDerivedNames) {
+    nextValues[name] = nextResolvedValues[name] ?? "";
+  }
+  return nextValues;
+}
+
+export function runtimeValuesAfterChange(
+  parameters: RuntimeParameterDefinition[],
+  currentValues: RuntimeValues,
+  changedName: string,
+  changedValue: string,
+): RuntimeValues {
+  return syncAutoDerivedValues(
+    parameters,
+    { ...currentValues, [changedName]: changedValue },
+    changedName,
+  );
+}
+
 export function runtimeValuesWithDefaults(
   parameters: RuntimeParameterDefinition[],
   savedValues: RuntimeValues,
 ): RuntimeValues {
-  return Object.fromEntries(
+  const values = Object.fromEntries(
     parameters.map((parameter) => [
       parameter.name,
       savedValues[parameter.name] ?? parameter.defaultValue,
     ]),
   );
+  return syncAutoDerivedValues(parameters, values);
 }
 
 export function validateRuntimeValues(

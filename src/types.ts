@@ -207,6 +207,12 @@ export interface RunOutput {
   stderr: string;
 }
 
+export interface ClearRunHistoryResult {
+  deletedCount: number;
+  deletedLogCount: number;
+  failedLogCount: number;
+}
+
 export interface AppSettings {
   theme: ThemeMode;
   defaultInterpreterId: string | null;
