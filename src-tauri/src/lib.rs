@@ -16,9 +16,11 @@ use tauri_plugin_dialog::{DialogExt, FilePath};
 use tokio::{
     fs::OpenOptions,
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    sync::broadcast,
 };
 use uuid::Uuid;
 
+mod api_server;
 mod backup_files;
 mod command_template;
 mod database;
@@ -63,6 +65,8 @@ struct AppState {
     bundled_python_dir: PathBuf,
     running: Arc<Mutex<HashMap<String, RunningProcess>>>,
     stopping: Arc<Mutex<HashMap<String, String>>>,
+    api_events: broadcast::Sender<ApiRunEvent>,
+    api_server: Arc<Mutex<Option<api_server::ApiServerHandle>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -263,6 +267,49 @@ struct RunStatusEvent {
     duration_ms: Option<i64>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ApiRunEvent {
+    kind: String,
+    run_id: String,
+    chunk: Option<String>,
+    status: Option<String>,
+    exit_code: Option<i32>,
+    finished_at: Option<String>,
+    duration_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MobileApiSettings {
+    enabled: bool,
+    bind_host: String,
+    port: u16,
+}
+
+impl Default for MobileApiSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_host: "0.0.0.0".to_string(),
+            port: 17631,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct MobileApiStatus {
+    enabled: bool,
+    bind_host: String,
+    port: u16,
+    pairing_code: String,
+    token_configured: bool,
+    server_running: bool,
+    base_urls: Vec<String>,
+    message: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClearRunHistoryResult {
@@ -285,6 +332,15 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let state = initialize_state(app.handle())?;
+            let app_handle = app.handle().clone();
+            if let Ok(settings) = load_mobile_api_settings(&state) {
+                if settings.enabled {
+                    let state_for_server = state.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = apply_mobile_api_server(app_handle, state_for_server, settings).await;
+                    });
+                }
+            }
             app.manage(state);
             Ok(())
         })
@@ -310,6 +366,9 @@ pub fn run() {
             check_interpreter_health,
             get_bundled_python_status,
             install_bundled_python,
+            get_mobile_api_status,
+            save_mobile_api_settings,
+            regenerate_mobile_pairing_code,
             get_settings,
             save_settings,
             read_text_file,
@@ -339,16 +398,20 @@ fn initialize_state(app: &AppHandle) -> Result<AppState, tauri::Error> {
     let db_path = app_data_dir.join("workbench.sqlite");
 
     database::init_database(&db_path).map_err(|err| tauri::Error::Anyhow(err))?;
+    ensure_mobile_api_settings(&db_path).map_err(|err| tauri::Error::Anyhow(err))?;
     seed_defaults(app, &db_path, &bundled_python_dir).map_err(|err| tauri::Error::Anyhow(err))?;
     cleanup_retained_runs(&db_path, &log_dir).map_err(|err| tauri::Error::Anyhow(err))?;
     recover_interrupted_runs(&db_path).map_err(|err| tauri::Error::Anyhow(err))?;
 
+    let (api_events, _) = broadcast::channel(512);
     Ok(AppState {
         db_path,
         log_dir,
         bundled_python_dir,
         running: Arc::new(Mutex::new(HashMap::new())),
         stopping: Arc::new(Mutex::new(HashMap::new())),
+        api_events,
+        api_server: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -356,6 +419,160 @@ fn recover_interrupted_runs(db_path: &Path) -> anyhow::Result<()> {
     let conn = Connection::open(db_path)?;
     run_recovery::recover_interrupted_runs(&conn, &now_iso())?;
     Ok(())
+}
+
+fn ensure_mobile_api_settings(db_path: &Path) -> anyhow::Result<()> {
+    let conn = Connection::open(db_path)?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM mobile_api_settings", [], |row| {
+        row.get(0)
+    })?;
+    if count == 0 {
+        conn.execute(
+            "INSERT INTO mobile_api_settings (
+                id, enabled, bind_host, port, pairing_code, token_hash, updated_at
+             ) VALUES (1, 0, '0.0.0.0', 17631, ?1, NULL, ?2)",
+            params![generate_pairing_code(), now_iso()],
+        )?;
+    } else {
+        let pairing_code: String = conn
+            .query_row(
+                "SELECT pairing_code FROM mobile_api_settings WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        if pairing_code.trim().is_empty() {
+            conn.execute(
+                "UPDATE mobile_api_settings SET pairing_code = ?1, updated_at = ?2 WHERE id = 1",
+                params![generate_pairing_code(), now_iso()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn load_mobile_api_settings(state: &AppState) -> anyhow::Result<MobileApiSettings> {
+    let conn = open_connection(state)?;
+    conn.query_row(
+        "
+        SELECT enabled, bind_host, port
+        FROM mobile_api_settings
+        WHERE id = 1
+        ",
+        [],
+        |row| {
+            Ok(MobileApiSettings {
+                enabled: row.get::<_, i64>(0)? != 0,
+                bind_host: row.get(1)?,
+                port: row.get::<_, i64>(2)? as u16,
+            })
+        },
+    )
+    .optional()
+    .map(|settings| settings.unwrap_or_default())
+    .map_err(Into::into)
+}
+
+fn mobile_api_pairing_code(state: &AppState) -> anyhow::Result<String> {
+    let conn = open_connection(state)?;
+    conn.query_row(
+        "SELECT pairing_code FROM mobile_api_settings WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or_default())
+    .map_err(Into::into)
+}
+
+fn mobile_api_status(state: &AppState) -> anyhow::Result<MobileApiStatus> {
+    let settings = load_mobile_api_settings(state)?;
+    let conn = open_connection(state)?;
+    let (pairing_code, token_hash): (String, Option<String>) = conn
+        .query_row(
+            "SELECT pairing_code, token_hash FROM mobile_api_settings WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or_else(|| (String::new(), None));
+    let (server_running, status_host, status_port) = state
+        .api_server
+        .lock()
+        .map(|server| {
+            server
+                .as_ref()
+                .map(|server| (true, server.bind_host.clone(), server.port))
+                .unwrap_or((false, settings.bind_host.clone(), settings.port))
+        })
+        .unwrap_or((false, settings.bind_host.clone(), settings.port));
+    let base_urls = mobile_api_base_urls(&status_host, status_port);
+    Ok(MobileApiStatus {
+        enabled: settings.enabled,
+        bind_host: settings.bind_host,
+        port: settings.port,
+        pairing_code,
+        token_configured: token_hash.is_some(),
+        server_running,
+        base_urls,
+        message: if settings.enabled && server_running {
+            "移动端 API 已运行".to_string()
+        } else if settings.enabled {
+            "移动端 API 正在启动或端口不可用".to_string()
+        } else {
+            "移动端 API 未启用".to_string()
+        },
+    })
+}
+
+async fn apply_mobile_api_server(
+    app: AppHandle,
+    state: AppState,
+    settings: MobileApiSettings,
+) -> anyhow::Result<()> {
+    let old_server = {
+        let mut guard = state
+            .api_server
+            .lock()
+            .map_err(|_| anyhow!("移动端 API 状态锁已损坏"))?;
+        guard.take()
+    };
+    if let Some(mut server) = old_server {
+        server.stop();
+    }
+    if !settings.enabled {
+        return Ok(());
+    }
+    let handle = api_server::start(app, state.clone(), settings).await?;
+    let mut guard = state
+        .api_server
+        .lock()
+        .map_err(|_| anyhow!("移动端 API 状态锁已损坏"))?;
+    *guard = Some(handle);
+    Ok(())
+}
+
+fn mobile_api_base_urls(bind_host: &str, port: u16) -> Vec<String> {
+    let mut hosts = Vec::new();
+    if bind_host == "0.0.0.0" || bind_host == "::" {
+        hosts.push("127.0.0.1".to_string());
+        if let Some(ip) = detect_lan_ip() {
+            hosts.push(ip);
+        }
+    } else {
+        hosts.push(bind_host.to_string());
+    }
+    hosts
+        .into_iter()
+        .map(|host| format!("http://{host}:{port}"))
+        .collect()
+}
+
+fn detect_lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
 }
 
 fn cleanup_retained_runs(db_path: &Path, log_dir: &Path) -> anyhow::Result<()> {
@@ -904,6 +1121,10 @@ fn now_iso() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn generate_pairing_code() -> String {
+    format!("{:06}", Uuid::new_v4().as_u128() % 1_000_000)
+}
+
 fn task_template(task: &TaskRecord) -> &str {
     match task.kind {
         TaskKind::PythonTask => task
@@ -1438,8 +1659,10 @@ async fn stream_reader<R: AsyncRead + Unpin, T: tauri::Runtime>(
     mut reader: R,
     log_path: PathBuf,
     app: AppHandle<T>,
+    api_events: broadcast::Sender<ApiRunEvent>,
     run_id: String,
     event_name: &'static str,
+    api_event_kind: &'static str,
     output_encoding: String,
 ) -> anyhow::Result<()> {
     let mut file = OpenOptions::new()
@@ -1459,9 +1682,18 @@ async fn stream_reader<R: AsyncRead + Unpin, T: tauri::Runtime>(
                     event_name,
                     RunStreamEvent {
                         run_id: run_id.clone(),
-                        chunk: tail,
+                        chunk: tail.clone(),
                     },
                 );
+                let _ = api_events.send(api_server::run_event_stream(
+                    api_event_kind,
+                    run_id.clone(),
+                    Some(tail),
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
             }
             break;
         }
@@ -1474,9 +1706,18 @@ async fn stream_reader<R: AsyncRead + Unpin, T: tauri::Runtime>(
             event_name,
             RunStreamEvent {
                 run_id: run_id.clone(),
-                chunk,
+                chunk: chunk.clone(),
             },
         );
+        let _ = api_events.send(api_server::run_event_stream(
+            api_event_kind,
+            run_id.clone(),
+            Some(chunk),
+            None,
+            None,
+            None,
+            None,
+        ));
     }
     Ok(())
 }
@@ -1580,6 +1821,7 @@ async fn monitor_attempt<T: tauri::Runtime>(
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     app: AppHandle<T>,
+    api_events: broadcast::Sender<ApiRunEvent>,
     run_id: String,
     output_encoding: String,
     timeout_seconds: u64,
@@ -1589,8 +1831,10 @@ async fn monitor_attempt<T: tauri::Runtime>(
             pipe,
             stdout_path,
             app.clone(),
+            api_events.clone(),
             run_id.clone(),
             "run://stdout",
+            "stdout",
             output_encoding.clone(),
         ))
     });
@@ -1599,8 +1843,10 @@ async fn monitor_attempt<T: tauri::Runtime>(
             pipe,
             stderr_path,
             app,
+            api_events,
             run_id,
             "run://stderr",
+            "stderr",
             output_encoding,
         ))
     });
@@ -1651,7 +1897,11 @@ fn read_run_record(conn: &Connection, run_id: &str) -> anyhow::Result<RunRecord>
 
 #[tauri::command]
 fn list_tasks(state: State<'_, AppState>) -> Result<Vec<TaskRecord>, String> {
-    let conn = open_connection(&state).map_err(|err| err.to_string())?;
+    list_task_records(state.inner())
+}
+
+fn list_task_records(state: &AppState) -> Result<Vec<TaskRecord>, String> {
+    let conn = open_connection(state).map_err(|err| err.to_string())?;
     let mut stmt = conn
         .prepare("SELECT id FROM tasks ORDER BY favorite DESC, updated_at DESC")
         .map_err(|err| err.to_string())?;
@@ -2032,7 +2282,11 @@ fn import_command(
 
 #[tauri::command]
 fn list_runs(state: State<'_, AppState>) -> Result<Vec<RunRecord>, String> {
-    let conn = open_connection(&state).map_err(|err| err.to_string())?;
+    list_run_records(state.inner())
+}
+
+fn list_run_records(state: &AppState) -> Result<Vec<RunRecord>, String> {
+    let conn = open_connection(state).map_err(|err| err.to_string())?;
     let mut stmt = conn
         .prepare(
             "
@@ -2127,8 +2381,12 @@ fn clear_run_history(state: State<'_, AppState>) -> Result<ClearRunHistoryResult
 
 #[tauri::command]
 fn read_run_output(state: State<'_, AppState>, run_id: String) -> Result<RunOutput, String> {
-    let conn = open_connection(&state).map_err(|err| err.to_string())?;
-    let run = read_run_record(&conn, &run_id).map_err(|err| err.to_string())?;
+    read_run_output_impl(state.inner(), &run_id)
+}
+
+fn read_run_output_impl(state: &AppState, run_id: &str) -> Result<RunOutput, String> {
+    let conn = open_connection(state).map_err(|err| err.to_string())?;
+    let run = read_run_record(&conn, run_id).map_err(|err| err.to_string())?;
     let stdout = fs::read_to_string(&run.stdout_log_path).unwrap_or_default();
     let stderr = fs::read_to_string(&run.stderr_log_path).unwrap_or_default();
     Ok(RunOutput { stdout, stderr })
@@ -2156,6 +2414,15 @@ fn get_task_runtime_values(
 async fn start_run(
     app: AppHandle,
     state: State<'_, AppState>,
+    task_id: String,
+    runtime_values: HashMap<String, String>,
+) -> Result<RunRecord, String> {
+    start_run_impl(app, state.inner().clone(), task_id, runtime_values).await
+}
+
+async fn start_run_impl(
+    app: AppHandle,
+    state: AppState,
     task_id: String,
     runtime_values: HashMap<String, String>,
 ) -> Result<RunRecord, String> {
@@ -2307,8 +2574,18 @@ async fn start_run(
             duration_ms: None,
         },
     );
+    let _ = state.api_events.send(api_server::run_event_stream(
+        "status",
+        run_id.clone(),
+        None,
+        Some("running".to_string()),
+        None,
+        None,
+        None,
+    ));
 
     let app_handle = app.clone();
+    let api_events = state.api_events.clone();
     let db_path = state.db_path.clone();
     let running = state.running.clone();
     let stopping = state.stopping.clone();
@@ -2336,6 +2613,7 @@ async fn start_run(
                 stdout_path.clone(),
                 stderr_path.clone(),
                 app_handle.clone(),
+                api_events.clone(),
                 run_id_for_task.clone(),
                 output_encoding.clone(),
                 timeout_seconds,
@@ -2374,9 +2652,18 @@ async fn start_run(
                     "run://stderr",
                     RunStreamEvent {
                         run_id: run_id_for_task.clone(),
-                        chunk: message,
+                        chunk: message.clone(),
                     },
                 );
+                let _ = api_events.send(api_server::run_event_stream(
+                    "stderr",
+                    run_id_for_task.clone(),
+                    Some(message),
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
                 let _ = update_run_attempt(&db_path, &run_id_for_task, attempt_count);
                 tokio::time::sleep(std::time::Duration::from_secs(retry_delay_seconds)).await;
 
@@ -2501,13 +2788,22 @@ async fn start_run(
         let _ = app_handle.emit(
             "run://status",
             RunStatusEvent {
-                run_id: run_id_for_task,
-                status,
+                run_id: run_id_for_task.clone(),
+                status: status.clone(),
                 exit_code,
-                finished_at: Some(finished_at),
+                finished_at: Some(finished_at.clone()),
                 duration_ms: Some(duration_ms),
             },
         );
+        let _ = api_events.send(api_server::run_event_stream(
+            "status",
+            run_id_for_task,
+            None,
+            Some(status),
+            exit_code,
+            Some(finished_at),
+            Some(duration_ms),
+        ));
     });
 
     read_run_record(&conn, &run_id).map_err(|err| err.to_string())
@@ -2515,22 +2811,26 @@ async fn start_run(
 
 #[tauri::command]
 fn stop_run(state: State<'_, AppState>, run_id: String) -> Result<(), String> {
+    stop_run_impl(state.inner(), &run_id)
+}
+
+fn stop_run_impl(state: &AppState, run_id: &str) -> Result<(), String> {
     let process = state
         .running
         .lock()
         .map_err(|_| "运行状态锁已损坏".to_string())?
-        .get(&run_id)
+        .get(run_id)
         .cloned()
         .ok_or_else(|| "找不到正在运行的任务".to_string())?;
     state
         .stopping
         .lock()
         .map_err(|_| "停止状态锁已损坏".to_string())?
-        .insert(run_id.clone(), "user_stop".to_string());
+        .insert(run_id.to_string(), "user_stop".to_string());
 
     if let Err(error) = process.tree.terminate() {
         if let Ok(mut stopping) = state.stopping.lock() {
-            stopping.remove(&run_id);
+            stopping.remove(run_id);
         }
         return Err(format!("停止进程树失败（PID {}）: {error}", process.pid));
     }
@@ -2763,6 +3063,66 @@ fn install_bundled_python(
         .map_err(|err| err.to_string())?;
 
     Ok(bundled_python_status(&app, &state))
+}
+
+#[tauri::command]
+fn get_mobile_api_status(state: State<'_, AppState>) -> Result<MobileApiStatus, String> {
+    mobile_api_status(state.inner()).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn save_mobile_api_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: MobileApiSettings,
+) -> Result<MobileApiStatus, String> {
+    if settings.bind_host.trim().is_empty() {
+        return Err("监听地址不能为空".to_string());
+    }
+    if settings.port < 1024 {
+        return Err("移动端 API 端口必须大于等于 1024".to_string());
+    }
+    let normalized = MobileApiSettings {
+        enabled: settings.enabled,
+        bind_host: settings.bind_host.trim().to_string(),
+        port: settings.port,
+    };
+    let conn = open_connection(&state).map_err(|err| err.to_string())?;
+    conn.execute(
+        "INSERT INTO mobile_api_settings (
+            id, enabled, bind_host, port, pairing_code, token_hash, updated_at
+         ) VALUES (1, ?1, ?2, ?3, ?4, NULL, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+            enabled=excluded.enabled,
+            bind_host=excluded.bind_host,
+            port=excluded.port,
+            updated_at=excluded.updated_at",
+        params![
+            bool_to_int(normalized.enabled),
+            normalized.bind_host.clone(),
+            normalized.port as i64,
+            generate_pairing_code(),
+            now_iso(),
+        ],
+    )
+    .map_err(|err| err.to_string())?;
+    apply_mobile_api_server(app, state.inner().clone(), normalized)
+        .await
+        .map_err(|err| err.to_string())?;
+    mobile_api_status(state.inner()).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn regenerate_mobile_pairing_code(state: State<'_, AppState>) -> Result<MobileApiStatus, String> {
+    let conn = open_connection(&state).map_err(|err| err.to_string())?;
+    conn.execute(
+        "UPDATE mobile_api_settings
+         SET pairing_code = ?1, token_hash = NULL, updated_at = ?2
+         WHERE id = 1",
+        params![generate_pairing_code(), now_iso()],
+    )
+    .map_err(|err| err.to_string())?;
+    mobile_api_status(state.inner()).map_err(|err| err.to_string())
 }
 
 #[tauri::command]

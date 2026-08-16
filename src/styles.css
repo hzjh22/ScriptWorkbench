@@ -883,6 +883,12 @@ button:disabled:hover {
   padding: 10px 12px;
 }
 
+.mobile-pairing-code {
+  font-size: 1.8rem;
+  font-weight: 800;
+  text-align: center;
+}
+
 .text-area {
   min-height: 110px;
   resize: vertical;

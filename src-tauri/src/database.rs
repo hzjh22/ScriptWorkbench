@@ -76,6 +76,25 @@ CREATE TABLE IF NOT EXISTS settings (
     auto_save_editor INTEGER NOT NULL DEFAULT 0,
     confirm_before_stop INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS mobile_api_settings (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    bind_host TEXT NOT NULL DEFAULT '0.0.0.0',
+    port INTEGER NOT NULL DEFAULT 17631,
+    pairing_code TEXT NOT NULL DEFAULT '',
+    token_hash TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS mobile_file_index (
+    file_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    modified_at TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 "#;
 
 pub(crate) fn init_database(db_path: &Path) -> anyhow::Result<()> {
@@ -143,7 +162,7 @@ pub(crate) fn migrate(conn: &Connection) -> anyhow::Result<()> {
         add_column_if_missing(&transaction, "task_runtime_parameters", column, definition)?;
     }
     transaction.execute(
-        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (1), (2), (3), (4)",
+        "INSERT OR IGNORE INTO schema_migrations (version) VALUES (1), (2), (3), (4), (5)",
         [],
     )?;
     transaction.commit()?;
@@ -200,7 +219,9 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+        assert!(table_has_column(&conn, "mobile_api_settings", "pairing_code").unwrap());
+        assert!(table_has_column(&conn, "mobile_file_index", "content_type").unwrap());
         assert!(table_has_column(&conn, "python_task_configs", "argument_mode").unwrap());
         assert!(table_has_column(&conn, "task_runtime_parameters", "condition_json").unwrap());
         let tables: i64 = conn

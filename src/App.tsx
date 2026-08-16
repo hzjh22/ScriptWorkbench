@@ -25,6 +25,8 @@ import {
   BundledPythonStatus,
   InterpreterHealth,
   InterpreterProfile,
+  MobileApiSettings,
+  MobileApiStatus,
   RunOutput,
   RunRecord,
   RuntimeValues,
@@ -54,6 +56,12 @@ const DEFAULT_SETTINGS: AppSettings = {
   logRetentionDays: 14,
   autoSaveEditor: false,
   confirmBeforeStop: true,
+};
+
+const DEFAULT_MOBILE_API_SETTINGS: MobileApiSettings = {
+  enabled: false,
+  bindHost: "0.0.0.0",
+  port: 17631,
 };
 
 type QrImageInfo = {
@@ -171,6 +179,10 @@ function App() {
   const [selectedRunSnapshot, setSelectedRunSnapshot] = useState<RunOutput | null>(null);
   const [bundledPythonStatus, setBundledPythonStatus] = useState<BundledPythonStatus | null>(null);
   const [bundledPythonBusy, setBundledPythonBusy] = useState(false);
+  const [mobileApiStatus, setMobileApiStatus] = useState<MobileApiStatus | null>(null);
+  const [mobileApiDraft, setMobileApiDraft] =
+    useState<MobileApiSettings>(DEFAULT_MOBILE_API_SETTINGS);
+  const [mobileApiBusy, setMobileApiBusy] = useState(false);
   const [taskKindFilter, setTaskKindFilter] = useState<"all" | TaskKind>("all");
   const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [runSearch, setRunSearch] = useState("");
@@ -267,11 +279,12 @@ function App() {
   async function loadWorkspace() {
     setIsLoading(true);
     try {
-      const [taskList, runList, interpreterList, loadedSettings] = await Promise.all([
+      const [taskList, runList, interpreterList, loadedSettings, loadedMobileApiStatus] = await Promise.all([
         api.listTasks(),
         api.listRuns(),
         api.listInterpreterProfiles(),
         api.getSettings(),
+        api.getMobileApiStatus(),
       ]);
       const bundledStatus = await api.getBundledPythonStatus();
       setTasks(taskList);
@@ -280,6 +293,12 @@ function App() {
       setInterpreters(interpreterList);
       setSettings(loadedSettings);
       setSettingsDraft(loadedSettings);
+      setMobileApiStatus(loadedMobileApiStatus);
+      setMobileApiDraft({
+        enabled: loadedMobileApiStatus.enabled,
+        bindHost: loadedMobileApiStatus.bindHost,
+        port: loadedMobileApiStatus.port,
+      });
       setBundledPythonStatus(bundledStatus);
       if (!selectedTaskId && taskList.length > 0) {
         setSelectedTaskId(taskList[0].id);
@@ -1164,6 +1183,37 @@ function App() {
       flashStatus("设置已保存");
     } catch (error) {
       setStatusMessage(`设置保存失败: ${String(error)}`);
+    }
+  }
+
+  async function handleSaveMobileApiSettings() {
+    setMobileApiBusy(true);
+    try {
+      const saved = await api.saveMobileApiSettings(mobileApiDraft);
+      setMobileApiStatus(saved);
+      setMobileApiDraft({
+        enabled: saved.enabled,
+        bindHost: saved.bindHost,
+        port: saved.port,
+      });
+      flashStatus(saved.serverRunning ? "移动端 API 已启动" : "移动端 API 设置已保存");
+    } catch (error) {
+      setStatusMessage(`移动端 API 设置失败: ${String(error)}`);
+    } finally {
+      setMobileApiBusy(false);
+    }
+  }
+
+  async function handleRegenerateMobilePairingCode() {
+    setMobileApiBusy(true);
+    try {
+      const status = await api.regenerateMobilePairingCode();
+      setMobileApiStatus(status);
+      flashStatus("移动端配对码已重置");
+    } catch (error) {
+      setStatusMessage(`重置配对码失败: ${String(error)}`);
+    } finally {
+      setMobileApiBusy(false);
     }
   }
 
@@ -2334,6 +2384,104 @@ function App() {
                         }))
                       }
                     />
+                  </div>
+                </div>
+
+                <div className="panel settings-card">
+                  <div className="panel-header">
+                    <div>
+                      <h3>移动端连接</h3>
+                      <p className="muted">让手机通过局域网查看任务、运行日志并下载输出文件。</p>
+                    </div>
+                    <button
+                      className="secondary-button"
+                      disabled={mobileApiBusy}
+                      onClick={() => void handleSaveMobileApiSettings()}
+                    >
+                      {mobileApiBusy ? "保存中..." : "保存连接设置"}
+                    </button>
+                  </div>
+
+                  <div className="field inline">
+                    <SafeToggle
+                      checked={mobileApiDraft.enabled}
+                      label="启用移动端 API"
+                      onChange={(next) =>
+                        setMobileApiDraft((current) => ({
+                          ...current,
+                          enabled: next,
+                        }))
+                      }
+                    />
+                  </div>
+
+                  <div className="filter-grid">
+                    <label className="field">
+                      <span>监听地址</span>
+                      <SafeSingleLineInput
+                        value={mobileApiDraft.bindHost}
+                        onChange={(value) =>
+                          setMobileApiDraft((current) => ({
+                            ...current,
+                            bindHost: value,
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="field">
+                      <span>端口</span>
+                      <input
+                        className="text-input"
+                        type="number"
+                        min={1024}
+                        max={65535}
+                        value={mobileApiDraft.port}
+                        onChange={(event) =>
+                          setMobileApiDraft((current) => ({
+                            ...current,
+                            port: Number(event.currentTarget.value) || 17631,
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+
+                  <div className="detail-grid">
+                    <div>
+                      <span>服务状态</span>
+                      <strong>{mobileApiStatus?.serverRunning ? "运行中" : "未运行"}</strong>
+                    </div>
+                    <div>
+                      <span>Token</span>
+                      <strong>{mobileApiStatus?.tokenConfigured ? "已配对" : "未配对"}</strong>
+                    </div>
+                  </div>
+
+                  <label className="field">
+                    <span>手机访问地址</span>
+                    <pre className="command-preview">
+                      {mobileApiStatus?.baseUrls.length
+                        ? mobileApiStatus.baseUrls.join("\n")
+                        : "启用后显示局域网访问地址"}
+                    </pre>
+                  </label>
+
+                  <label className="field">
+                    <span>配对码</span>
+                    <pre className="command-preview mobile-pairing-code">
+                      {mobileApiStatus?.pairingCode || "------"}
+                    </pre>
+                  </label>
+
+                  <div className="panel-actions">
+                    <button
+                      className="ghost-button"
+                      disabled={mobileApiBusy}
+                      onClick={() => void handleRegenerateMobilePairingCode()}
+                    >
+                      重置配对码
+                    </button>
+                    <span className="muted">{mobileApiStatus?.message ?? "移动端 API 未初始化"}</span>
                   </div>
                 </div>
 

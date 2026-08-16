@@ -1324,10 +1324,22 @@ mod tests {
             .join(name)
     }
 
+    fn test_python() -> String {
+        if let Ok(path) = std::env::var("SCRIPT_WORKBENCH_TEST_PYTHON") {
+            return path;
+        }
+        let common = Path::new(r"D:\python\Python311\python.exe");
+        if common.is_file() {
+            return common.to_string_lossy().into_owned();
+        }
+        "python".to_string()
+    }
+
     #[tokio::test]
     async fn scans_argparse_without_importing_the_target_module() {
+        let interpreter = test_python();
         let preview = scan_python_script_impl(
-            "python",
+            &interpreter,
             &fixture("scanner_argparse.py"),
             "--chapters 77-117 --quiet-pages",
             false,
@@ -1358,14 +1370,15 @@ mod tests {
 
     #[tokio::test]
     async fn scans_click_typer_and_sidecar_sources() {
-        let click = scan_python_script_impl("python", &fixture("scanner_click.py"), "", false)
+        let interpreter = test_python();
+        let click = scan_python_script_impl(&interpreter, &fixture("scanner_click.py"), "", false)
             .await
             .unwrap();
         assert!(click.parameters.iter().any(|parameter| {
             parameter.name == "token" && parameter.parameter_type == RuntimeParameterType::Secret
         }));
 
-        let typer = scan_python_script_impl("python", &fixture("scanner_typer.py"), "", false)
+        let typer = scan_python_script_impl(&interpreter, &fixture("scanner_typer.py"), "", false)
             .await
             .unwrap();
         assert!(typer.parameters.iter().any(|parameter| {
@@ -1374,7 +1387,7 @@ mod tests {
                 && parameter.default_value == "30"
         }));
 
-        let sidecar = scan_python_script_impl("python", &fixture("scanner_sidecar.py"), "", false)
+        let sidecar = scan_python_script_impl(&interpreter, &fixture("scanner_sidecar.py"), "", false)
             .await
             .unwrap();
         assert_eq!(sidecar.source, "sidecar");
@@ -1383,7 +1396,8 @@ mod tests {
 
     #[tokio::test]
     async fn confirmed_help_scan_supplements_static_results() {
-        let preview = scan_python_script_impl("python", &fixture("scanner_help.py"), "", true)
+        let interpreter = test_python();
+        let preview = scan_python_script_impl(&interpreter, &fixture("scanner_help.py"), "", true)
             .await
             .unwrap();
         assert!(preview
@@ -1398,6 +1412,7 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_fixtures_match_their_golden_parameter_types() {
+        let interpreter = test_python();
         for (fixture_name, allow_help) in [
             ("scanner_argparse.py", false),
             ("scanner_click.py", false),
@@ -1405,7 +1420,7 @@ mod tests {
             ("scanner_help.py", true),
             ("scanner_sidecar.py", false),
         ] {
-            let preview = scan_python_script_impl("python", &fixture(fixture_name), "", allow_help)
+            let preview = scan_python_script_impl(&interpreter, &fixture(fixture_name), "", allow_help)
                 .await
                 .unwrap();
             let golden_path = fixture(&fixture_name.replace(".py", ".golden.json"));
@@ -1430,8 +1445,9 @@ mod tests {
 
     #[tokio::test]
     async fn comicbox_fixture_derives_url_and_output_and_can_omit_chapters() {
+        let interpreter = test_python();
         let preview = scan_python_script_impl(
-            "python",
+            &interpreter,
             &fixture("backup_comicbox_fixture.py"),
             "--book-url https://www.comicbox.xyz/book/{{book_id}} --output F:\\CIL\\comicbox_{{book_id}}_backup --chapters 77-117 --delay 0 --workers 12 --quiet-pages",
             false,
@@ -1495,8 +1511,9 @@ mod tests {
 
     #[tokio::test]
     async fn video_fixture_builds_three_source_modes_and_inverse_flags() {
+        let interpreter = test_python();
         let preview = scan_python_script_impl(
-            "python",
+            &interpreter,
             &fixture("summarize_video_sources_fixture.py"),
             "--watch-url https://hanime1.me/watch?v={{video_id}} --video-id {{video_id}}",
             false,

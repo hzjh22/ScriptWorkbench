@@ -126,6 +126,7 @@ Rust 后端负责：
 E:\ScriptWorkbench
 ├─ .cargo/                     Rust 工具链与 linker 配置
 ├─ artifacts/                  自测截图、报告、临时证据
+├─ android-client/             Android 手机端客户端工程
 ├─ fixtures/                   自测用脚本与测试素材
 ├─ public/                     前端静态资源
 ├─ scripts/                    构建辅助、自测脚本
@@ -1101,3 +1102,195 @@ E:\ScriptWorkbench
 
 当前脚本 SHA-256：`F0EB526D3673A41A86A72BFDB4EA5D9D96582205152F80227B2F453D89D1E5E9`。
 
+---
+
+## 27. Telegram QR 登录在软件内显示过大的修复（2026-07-25）
+
+问题：`F:\CIL\tg_backup.py` 在 QR 登录时会同时输出二维码 PNG 路径、`tg://login?...` 链接和终端 ASCII 二维码。Script Workbench 的 stdout 区域不是交互式终端，大块 ASCII 二维码会撑出横向/纵向滚动条，导致用户在软件内看起来像二维码显示不全。
+
+修复：
+
+- 主脚本：`F:\CIL\tg_backup.py`。
+- 新增参数 `--qr-ascii {auto,always,never}`：
+  - `auto`：仅在 stdout 是交互式终端时打印 ASCII 二维码。
+  - `always`：强制打印终端二维码。
+  - `never`：只输出 QR 图片路径和登录链接。
+- 新增环境变量覆盖：`TG_BACKUP_QR_ASCII=1/0/always/never`。
+- 软件内 Telegram 任务已新增高级参数“二维码终端预览”，默认 `never`，启动命令会追加 `--qr-ascii never`。
+- 原始脚本备份：`F:\CIL\tg_backup.py.pre-qr-stdout-20260725-001.bak`。
+- 数据库备份：`C:\Users\Lmoon\AppData\Roaming\com.lmoon.scriptworkbench\workbench.sqlite.pre-tg-qr-stdout-20260725-203407.bak`。
+
+验证：
+
+- `D:\python\Python311\python.exe -m py_compile F:\CIL\tg_backup.py` 通过。
+- `D:\python\Python311\python.exe F:\CIL\tg_backup.py --help` 已显示 `--qr-ascii {auto,always,never}`。
+- 在非交互式 stdout 下，`should_render_qr_ascii('auto') == False`，`render_qr_ascii(..., 'auto')` 输出字符数为 `0`。
+- 当前脚本 SHA-256：`110062E8F055B854ECA4D5451774D89B1C974684DAD1706F60DBC883608CF97B`。
+
+使用方式：在软件里登录 Telegram 时，直接打开 stdout 中显示的 `QR image: F:\CIL\tg_backup.qr.png`，用手机 Telegram 的“设备 / Link Desktop Device”扫描；stdout 不再显示大块 ASCII 二维码。
+
+---
+
+## 28. Telegram QR 扫码后不继续登录的原因分析与修复（2026-07-25）
+
+现象：用户在软件内运行 Telegram 媒体备份任务，stdout 显示 `Scan this QR with Telegram mobile app`，扫码后没有进入后续下载。读取最近运行记录发现最新 Run ID `42eadc73-f028-4728-accd-b1430d33905d` 仍处于 `running`，stdout 连续出现 `QR expired, creating a new one...`，说明 Telethon 一直没有收到 Telegram 手机端确认登录事件。
+
+原因判断：
+
+- 脚本此前每次都覆盖同一个固定二维码路径：`F:\CIL\tg_backup.qr.png`。
+- Windows 图片查看器可能缓存已打开图片，用户看似打开了同一路径，实际扫描的是旧二维码；Telegram QR token 约 120 秒过期，旧图扫码后不会让脚本继续。
+- Telegram 手机端扫码入口必须是 `Settings -> Devices -> Link Desktop Device`，扫码后还要确认登录提示。
+- 如果账号开启 Two-Step Verification，QR 接受后还需要二步验证密码；在 Script Workbench 的非交互运行环境里不能用 `getpass()` 阻塞等待输入。
+
+修复：
+
+- 主脚本：`F:\CIL\tg_backup.py`。
+- `save_qr_png()` 改为每次同时保存：
+  - 唯一二维码文件：`tg_backup.qr.YYYYMMDD-HHMMSS.NNN.<token_hash>.png`
+  - 最新覆盖文件：`tg_backup.qr.png`
+- stdout 新增 `QR attempt`、`QR image`、`QR latest image`、手机端扫码路径和确认提示，要求优先打开唯一二维码文件，避免扫旧图。
+- QR 被 Telegram 接受后输出 `QR login accepted by Telegram.`。
+- 新增 `--two-step-password-env`，默认读取环境变量 `TG_BACKUP_2FA_PASSWORD`；非交互环境遇到二步验证时输出明确错误，不再静默卡住。
+- 修改前备份：`F:\CIL\tg_backup.py.pre-qr-unique-20260725-001.bak`。
+- 数据库备份：`C:\Users\Lmoon\AppData\Roaming\com.lmoon.scriptworkbench\workbench.sqlite.pre-tg-qr-unique-20260725-204314.bak`。
+
+验证：
+
+- `D:\python\Python311\python.exe -m py_compile F:\CIL\tg_backup.py` 通过。
+- `--help` 已显示 `--qr-ascii` 和 `--two-step-password-env`。
+- 自测生成唯一二维码和 latest 二维码均存在，且路径不同。
+- 非交互环境未设置二步验证密码时，`read_two_step_password()` 会返回明确 RuntimeError。
+- 当前脚本 SHA-256：`7C3C7A84DFF9ED810459270B25DCB047B2F64EA54F294F1529A525DCDBB764DB`。
+
+---
+
+## 29. Telegram QR 登录内嵌显示与运行记录输出区放大（2026-07-25）
+
+需求：用户反馈 Telegram QR 登录流程过于费劲，希望不要只在 stdout 中显示路径，而是在软件中直接显示二维码，并放大运行记录中的 Stdout 显示面积。
+
+前端修改：
+
+- 修改文件：`E:\ScriptWorkbench\src\App.tsx`。
+- 新增 `TerminalOutputView`，在 stdout 中自动识别：
+  - `QR image: F:\...\*.png`
+  - `QR latest image: F:\...\*.png`
+  - 兼容旧日志中的 `WindowsPath('F:/...png')` 输出。
+- 检出 QR 图片后，使用 Tauri `convertFileSrc()` 转为 asset URL，在软件内直接渲染二维码图片。
+- 二维码卡片显示：扫码说明、图片路径、二维码预览和“打开二维码图片”按钮。
+- 内置终端和运行记录详情均使用新的输出组件。
+
+样式修改：
+
+- 修改文件：`E:\ScriptWorkbench\src\styles.css`。
+- 新增 `.qr-preview-card`、`.qr-preview-image`、`.terminal-output-wrap` 等样式。
+- 运行记录详情输出区使用 `.run-record-terminal-grid`，改为单列显示。
+- 运行记录中的 stdout/stderr 区域从原先较小的 `220~320px` 扩展为 `min-height: 360px; max-height: 58vh`。
+
+Tauri 配置：
+
+- 修改文件：`E:\ScriptWorkbench\src-tauri\tauri.conf.json`。
+- 开启 `app.security.assetProtocol`，允许前端 `<img>` 加载本地二维码图片。
+- 当前 scope：
+  - `F:\CIL\**`
+  - `E:\ScriptWorkbench\**`
+
+验证：
+
+- `F:\node\npm.cmd test`：6 个测试文件、24 项测试通过。
+- `F:\node\npm.cmd run build`：TypeScript / Vite 生产构建通过。
+- `F:\node\npm.cmd run tauri -- build`：Release、MSI、NSIS 构建通过。
+
+发布产物：
+
+- Release：`E:\ScriptWorkbench\src-tauri\target\release\script-workbench.exe`
+  - SHA-256：`762F7C4208C81B0FA583E5497B776B79E0723C8EACE7C3E2B620E18C0FEC5967`
+- NSIS：`E:\ScriptWorkbench\src-tauri\target\release\bundle\nsis\Script Workbench_0.1.0_x64-setup.exe`
+  - SHA-256：`174506D20BC0CF6151CF7C3F692427A7D56F3CA407027C12BB1529CAEA0E8C47`
+- MSI：`E:\ScriptWorkbench\src-tauri\target\release\bundle\msi\Script Workbench_0.1.0_x64_en-US.msi`
+  - SHA-256：`2617FA533704E8148526335F17CDB9D47BB1AE79546594A2C3CAB7CCEC74A9AE`
+
+备份：
+
+- `E:\ScriptWorkbench\src\App.tsx.pre-qr-inline-20260725-001.bak`
+- `E:\ScriptWorkbench\src\styles.css.pre-qr-inline-20260725-001.bak`
+- `E:\ScriptWorkbench\src-tauri\tauri.conf.json.pre-qr-asset-20260725-001.bak`
+
+---
+
+## 30. 移动端 API 与 Android 客户端 V1（2026-08-16）
+
+目标：在不打乱现有 Windows 桌面端代码结构的前提下，新增“电脑执行、手机遥控和下载”的移动端能力。
+
+桌面端新增：
+
+- 新增后端模块：`E:\ScriptWorkbench\src-tauri\src\api_server.rs`。
+- 使用嵌入式 HTTP 服务提供局域网 API，默认关闭，由设置页手动启用。
+- 新增设置页“移动端连接”卡片，可配置启用状态、监听地址、端口，显示访问地址和 6 位配对码。
+- 数据库 schema 升级到 v5，新增：
+  - `mobile_api_settings`
+  - `mobile_file_index`
+- 配对流程为 `POST /api/pair`，手机端用配对码换取 Bearer Token。
+- 已实现 API：
+  - `GET /api/health`
+  - `POST /api/pair`
+  - `GET /api/tasks`
+  - `GET /api/tasks/{task_id}`
+  - `POST /api/tasks/{task_id}/run`
+  - `GET /api/runs`
+  - `GET /api/runs/{run_id}`
+  - `GET /api/runs/{run_id}/output`
+  - `GET /api/runs/{run_id}/stream`
+  - `POST /api/runs/{run_id}/stop`
+  - `GET /api/runs/{run_id}/files`
+  - `GET /api/files/{file_id}/download`
+- 文件下载支持 HTTP Range，输出文件通过 file_id 映射真实路径，不把本机路径作为下载参数。
+- 运行日志同时发送给桌面 Tauri event 和移动端 SSE 事件流。
+
+Android 客户端：
+
+- 新增独立目录：`E:\ScriptWorkbench\android-client`。
+- 当前为零外部依赖的原生 Android Java 客户端，避免本机 Kotlin/Compose Gradle 插件下载阻塞。
+- 功能包含：
+  - 输入电脑 API 地址和配对码
+  - 保存 Token
+  - 查看任务列表
+  - 启动任务
+  - 查看运行记录
+  - 读取 stdout/stderr
+  - 查看运行产物
+  - 通过系统 DownloadManager 下载文件到 `Downloads/ScriptWorkbench`
+- Android Manifest 已开启局域网 HTTP 访问所需的 `INTERNET` 和 `usesCleartextTraffic`。
+
+实现文件：
+
+- `E:\ScriptWorkbench\src-tauri\src\api_server.rs`
+- `E:\ScriptWorkbench\src-tauri\src\database.rs`
+- `E:\ScriptWorkbench\src-tauri\src\lib.rs`
+- `E:\ScriptWorkbench\src\App.tsx`
+- `E:\ScriptWorkbench\src\types.ts`
+- `E:\ScriptWorkbench\src\lib\api.ts`
+- `E:\ScriptWorkbench\android-client\app\src\main\java\com\lmoon\scriptworkbench\mobile\MainActivity.java`
+
+验证：
+
+- `E:\ScriptWorkbench\scripts\tauri-env.cmd cargo test`：41 项 Rust 测试通过。
+- `F:\node\npm.cmd test`：6 个测试文件、28 项前端测试通过。
+- `F:\node\npm.cmd run build`：TypeScript / Vite 生产构建通过。
+- `F:\node\npm.cmd run tauri -- build`：Release、MSI、NSIS 构建通过。
+
+Android 构建状态：
+
+- 本机存在 Gradle：`D:\download\document\IDEA\.gradle\wrapper\dists\gradle-9.2.1-bin\...\gradle.bat`。
+- 本机缓存存在 Android Gradle Plugin `9.0.1`。
+- `assembleDebug --offline` 当前阻塞于 AGP 自身依赖缺失：`kotlin-reflect-2.2.20.jar` 和 `kotlin-stdlib-2.2.20.jar` 未缓存。
+- 在线 `assembleDebug --info --stacktrace` 卡在 Maven 依赖解析阶段，未进入 Java 编译。
+- 因此本轮 Android 源码已落地，但 debug APK 还需要完成 Gradle/AGP 依赖下载后再构建。
+
+发布产物：
+
+- Release：`E:\ScriptWorkbench\src-tauri\target\release\script-workbench.exe`
+  - SHA-256：`137C29AFF14A78F97396DC9BFB16BD4DF9D12D6045AD180FC1B9375285117B05`
+- NSIS：`E:\ScriptWorkbench\src-tauri\target\release\bundle\nsis\Script Workbench_0.1.0_x64-setup.exe`
+  - SHA-256：`61ACCCBDB3B816842F7F1822D7F22A673F13D8D5C1F61F4EE32B80BBDC78404D`
+- MSI：`E:\ScriptWorkbench\src-tauri\target\release\bundle\msi\Script Workbench_0.1.0_x64_en-US.msi`
+  - SHA-256：`7B03156C7DE1869CDB33DC0D849FCC58B6FDC3A06A2F5474B6F92ECE67E483C7`

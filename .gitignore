@@ -16,6 +16,9 @@ dist-ssr
 target/
 src-tauri/target/
 src-tauri/target-updated/
+android-client/.gradle/
+android-client/build/
+android-client/app/build/
 
 # Local build and regression artifacts
 artifacts/

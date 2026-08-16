@@ -261,3 +261,17 @@ export interface BundledPythonStatus {
   version: string;
   message: string;
 }
+
+export interface MobileApiSettings {
+  enabled: boolean;
+  bindHost: string;
+  port: number;
+}
+
+export interface MobileApiStatus extends MobileApiSettings {
+  pairingCode: string;
+  tokenConfigured: boolean;
+  serverRunning: boolean;
+  baseUrls: string[];
+  message: string;
+}

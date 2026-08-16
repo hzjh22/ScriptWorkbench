@@ -12,6 +12,8 @@ const {
   readTextFileMock,
   saveInterpreterProfileMock,
   saveSettingsMock,
+  saveMobileApiSettingsMock,
+  regenerateMobilePairingCodeMock,
   getTaskRuntimeValuesMock,
   dialogOpenMock,
   dialogSaveMock,
@@ -26,6 +28,8 @@ const {
   readTextFileMock: vi.fn(),
   saveInterpreterProfileMock: vi.fn(),
   saveSettingsMock: vi.fn(),
+  saveMobileApiSettingsMock: vi.fn(),
+  regenerateMobilePairingCodeMock: vi.fn(),
   getTaskRuntimeValuesMock: vi.fn(),
   dialogOpenMock: vi.fn(),
   dialogSaveMock: vi.fn(),
@@ -181,6 +185,16 @@ vi.mock("./lib/api", () => ({
       version: "Python 3.11.3",
       message: "ok",
     })),
+    getMobileApiStatus: vi.fn(async () => ({
+      enabled: false,
+      bindHost: "0.0.0.0",
+      port: 17631,
+      pairingCode: "123456",
+      tokenConfigured: false,
+      serverRunning: false,
+      baseUrls: ["http://127.0.0.1:17631", "http://192.168.43.10:17631"],
+      message: "移动端 API 未启用",
+    })),
     previewTaskCommand: vi.fn(async () => ""),
     scanPythonScript: scanPythonScriptMock,
     checkScriptScanStatus: checkScriptScanStatusMock,
@@ -195,6 +209,8 @@ vi.mock("./lib/api", () => ({
     checkInterpreterHealth: vi.fn(),
     saveInterpreterProfile: saveInterpreterProfileMock,
     saveSettings: saveSettingsMock,
+    saveMobileApiSettings: saveMobileApiSettingsMock,
+    regenerateMobilePairingCode: regenerateMobilePairingCodeMock,
     readTextFile: readTextFileMock,
     writeTextFile: writeTextFileMock,
     pickFile: pickFileMock,
@@ -245,6 +261,26 @@ describe("App selftest interactions", () => {
     saveInterpreterProfileMock.mockImplementation(async (profile) => profile);
     saveSettingsMock.mockReset();
     saveSettingsMock.mockImplementation(async (settings) => settings);
+    saveMobileApiSettingsMock.mockReset();
+    saveMobileApiSettingsMock.mockImplementation(async (settings) => ({
+      ...settings,
+      pairingCode: "123456",
+      tokenConfigured: false,
+      serverRunning: settings.enabled,
+      baseUrls: [`http://127.0.0.1:${settings.port}`],
+      message: settings.enabled ? "移动端 API 已运行" : "移动端 API 未启用",
+    }));
+    regenerateMobilePairingCodeMock.mockReset();
+    regenerateMobilePairingCodeMock.mockImplementation(async () => ({
+      enabled: false,
+      bindHost: "0.0.0.0",
+      port: 17631,
+      pairingCode: "654321",
+      tokenConfigured: false,
+      serverRunning: false,
+      baseUrls: ["http://127.0.0.1:17631"],
+      message: "移动端 API 未启用",
+    }));
     getTaskRuntimeValuesMock.mockReset();
     getTaskRuntimeValuesMock.mockImplementation(async () => ({}));
     dialogOpenMock.mockReset();
@@ -551,6 +587,25 @@ describe("App selftest interactions", () => {
 
     expect(readTextFileMock).toHaveBeenCalledWith("E:/import.json");
     expect(saveSettingsMock).toHaveBeenCalled();
+  });
+
+  it("saves mobile API settings from the settings page", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByText("设置");
+    await user.click(screen.getByText("设置"));
+    await screen.findByText("移动端连接");
+
+    await user.click(screen.getByRole("switch", { name: "启用移动端 API" }));
+    await user.click(screen.getByRole("button", { name: "保存连接设置" }));
+
+    expect(saveMobileApiSettingsMock).toHaveBeenCalledWith({
+      enabled: true,
+      bindHost: "0.0.0.0",
+      port: 17631,
+    });
+    expect(await screen.findByText("移动端 API 已运行")).toBeTruthy();
   });
 
   it("clears completed run history while preserving running instances", async () => {

@@ -6,6 +6,8 @@ import {
   CommandImportResult,
   InterpreterHealth,
   InterpreterProfile,
+  MobileApiSettings,
+  MobileApiStatus,
   RunOutput,
   RunRecord,
   RuntimeValues,
@@ -70,6 +72,12 @@ export const api = {
     invoke<BundledPythonStatus>("get_bundled_python_status"),
   installBundledPython: (sourcePath: string) =>
     invoke<BundledPythonStatus>("install_bundled_python", { sourcePath }),
+  getMobileApiStatus: () =>
+    invoke<MobileApiStatus>("get_mobile_api_status"),
+  saveMobileApiSettings: (settings: MobileApiSettings) =>
+    invoke<MobileApiStatus>("save_mobile_api_settings", { settings }),
+  regenerateMobilePairingCode: () =>
+    invoke<MobileApiStatus>("regenerate_mobile_pairing_code"),
 
   getSettings: () => invoke<AppSettings>("get_settings"),
   saveSettings: (settings: AppSettings) =>
