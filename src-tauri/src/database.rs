@@ -95,6 +95,12 @@ CREATE TABLE IF NOT EXISTS mobile_file_index (
     content_type TEXT NOT NULL,
     indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+CREATE TABLE IF NOT EXISTS mobile_shared_folders (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    path TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 "#;
 
 pub(crate) fn init_database(db_path: &Path) -> anyhow::Result<()> {

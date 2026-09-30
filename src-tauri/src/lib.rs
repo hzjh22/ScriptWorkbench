@@ -63,6 +63,7 @@ struct AppState {
     db_path: PathBuf,
     log_dir: PathBuf,
     bundled_python_dir: PathBuf,
+    managed_scripts_dir: PathBuf,
     running: Arc<Mutex<HashMap<String, RunningProcess>>>,
     stopping: Arc<Mutex<HashMap<String, String>>>,
     api_events: broadcast::Sender<ApiRunEvent>,
@@ -106,6 +107,14 @@ struct PythonTaskConfig {
     script_hash: Option<String>,
     #[serde(default)]
     scan_snapshot: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedScriptImport {
+    script_path: String,
+    source_path: String,
+    copied_files: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -310,6 +319,14 @@ struct MobileApiStatus {
     message: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SharedFolder {
+    id: String,
+    label: String,
+    path: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ClearRunHistoryResult {
@@ -352,6 +369,7 @@ pub fn run() {
             delete_task,
             preview_task_command,
             scan_python_script,
+            import_python_script,
             check_script_scan_status,
             import_command,
             list_runs,
@@ -369,6 +387,9 @@ pub fn run() {
             get_mobile_api_status,
             save_mobile_api_settings,
             regenerate_mobile_pairing_code,
+            list_shared_folders,
+            add_shared_folder,
+            remove_shared_folder,
             get_settings,
             save_settings,
             read_text_file,
@@ -381,7 +402,8 @@ pub fn run() {
 }
 
 fn initialize_state(app: &AppHandle) -> Result<AppState, tauri::Error> {
-    let app_data_dir = if let Some(path) = std::env::var_os("SCRIPT_WORKBENCH_DATA_DIR") {
+    let data_dir_override = std::env::var_os("SCRIPT_WORKBENCH_DATA_DIR");
+    let app_data_dir = if let Some(path) = data_dir_override.clone() {
         PathBuf::from(path)
     } else {
         app.path()
@@ -395,9 +417,30 @@ fn initialize_state(app: &AppHandle) -> Result<AppState, tauri::Error> {
     let bundled_python_dir = app_data_dir.join("bundled-python");
     fs::create_dir_all(&bundled_python_dir)
         .map_err(|err| tauri::Error::Anyhow(anyhow!(err.to_string())))?;
+    let legacy_managed_scripts_dir = app_data_dir.join("managed-scripts");
+    let managed_scripts_dir = if let Some(path) = std::env::var_os("SCRIPT_WORKBENCH_MANAGED_SCRIPTS_DIR") {
+        PathBuf::from(path)
+    } else if data_dir_override.is_some() {
+        // Tests and explicitly isolated data directories stay fully isolated.
+        legacy_managed_scripts_dir.clone()
+    } else {
+        std::env::current_exe()
+            .map_err(|err| tauri::Error::Anyhow(anyhow!(err.to_string())))?
+            .parent()
+            .ok_or_else(|| tauri::Error::Anyhow(anyhow!("无法确定程序安装目录")))?
+            .join("managed-scripts")
+    };
+    fs::create_dir_all(&managed_scripts_dir)
+        .map_err(|err| tauri::Error::Anyhow(anyhow!(err.to_string())))?;
     let db_path = app_data_dir.join("workbench.sqlite");
 
     database::init_database(&db_path).map_err(|err| tauri::Error::Anyhow(err))?;
+    migrate_managed_script_library(
+        &db_path,
+        &legacy_managed_scripts_dir,
+        &managed_scripts_dir,
+    )
+    .map_err(|err| tauri::Error::Anyhow(err))?;
     ensure_mobile_api_settings(&db_path).map_err(|err| tauri::Error::Anyhow(err))?;
     seed_defaults(app, &db_path, &bundled_python_dir).map_err(|err| tauri::Error::Anyhow(err))?;
     cleanup_retained_runs(&db_path, &log_dir).map_err(|err| tauri::Error::Anyhow(err))?;
@@ -408,11 +451,98 @@ fn initialize_state(app: &AppHandle) -> Result<AppState, tauri::Error> {
         db_path,
         log_dir,
         bundled_python_dir,
+        managed_scripts_dir,
         running: Arc::new(Mutex::new(HashMap::new())),
         stopping: Arc::new(Mutex::new(HashMap::new())),
         api_events,
         api_server: Arc::new(Mutex::new(None)),
     })
+}
+
+fn user_path_string(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    raw.strip_prefix(r"\\?\")
+        .unwrap_or(&raw)
+        .to_string()
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory_contents(&source_path, &destination_path)?;
+        } else if !destination_path.exists() {
+            fs::copy(&source_path, &destination_path)
+                .with_context(|| format!("复制 {} 失败", source_path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn relocate_managed_path(path: &str, old_root: &Path, new_root: &Path) -> Option<String> {
+    let canonical = fs::canonicalize(path).ok()?;
+    let relative = canonical.strip_prefix(old_root).ok()?;
+    Some(user_path_string(&new_root.join(relative)))
+}
+
+fn migrate_managed_script_library(
+    db_path: &Path,
+    legacy_root: &Path,
+    managed_root: &Path,
+) -> anyhow::Result<()> {
+    if !legacy_root.is_dir() || legacy_root == managed_root {
+        return Ok(());
+    }
+    copy_directory_contents(legacy_root, managed_root)?;
+    let old_root = fs::canonicalize(legacy_root)?;
+    let new_root = fs::canonicalize(managed_root)?;
+    if old_root == new_root {
+        return Ok(());
+    }
+
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT p.task_id, p.script_path, t.working_directory
+         FROM python_task_configs p JOIN tasks t ON t.id = p.task_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    for (task_id, script_path, working_directory) in rows {
+        let Some(new_script_path) = relocate_managed_path(&script_path, &old_root, &new_root) else {
+            continue;
+        };
+        let new_working_directory = relocate_managed_path(&working_directory, &old_root, &new_root)
+            .unwrap_or_else(|| {
+                PathBuf::from(&new_script_path)
+                    .parent()
+                    .map(user_path_string)
+                    .unwrap_or_else(|| working_directory.clone())
+            });
+        conn.execute(
+            "UPDATE python_task_configs SET script_path = ?1 WHERE task_id = ?2",
+            params![new_script_path, task_id],
+        )?;
+        conn.execute(
+            "UPDATE tasks SET working_directory = ?1, updated_at = ?2 WHERE id = ?3",
+            params![new_working_directory, now_iso(), task_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn recover_interrupted_runs(db_path: &Path) -> anyhow::Result<()> {
@@ -2144,6 +2274,34 @@ fn save_task(state: State<'_, AppState>, task: TaskRecord) -> Result<TaskRecord,
 
 #[tauri::command]
 fn delete_task(state: State<'_, AppState>, task_id: String) -> Result<(), String> {
+    // Stop any running instance of this task first so deleting a task never
+    // leaves an orphaned process running in the background.
+    let running_processes = {
+        let running = state
+            .running
+            .lock()
+            .map_err(|_| "运行状态锁已损坏".to_string())?;
+        running
+            .iter()
+            .filter(|(_, process)| process.task_id == task_id)
+            .map(|(run_id, process)| (run_id.clone(), process.clone()))
+            .collect::<Vec<_>>()
+    };
+    if !running_processes.is_empty() {
+        {
+            let mut stopping = state
+                .stopping
+                .lock()
+                .map_err(|_| "停止状态锁已损坏".to_string())?;
+            for (run_id, _) in &running_processes {
+                stopping.insert(run_id.clone(), "task_deleted".to_string());
+            }
+        }
+        for (_, process) in &running_processes {
+            let _ = process.tree.terminate();
+        }
+    }
+
     let conn = open_connection(&state).map_err(|err| err.to_string())?;
     conn.execute(
         "DELETE FROM python_task_configs WHERE task_id = ?1",
@@ -2186,6 +2344,119 @@ fn preview_task_command(
     prepare_command(&task, &conn, &resolved.actual, &resolved.redacted)
         .map(|command| command.preview)
         .map_err(|err| err.to_string())
+}
+
+fn managed_script_dir_name(source: &Path) -> String {
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("script");
+    let mut safe = stem
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    safe.truncate(64);
+    if safe.trim_matches('_').is_empty() {
+        safe = "script".to_string();
+    }
+    format!("{}-{}", safe, &Uuid::new_v4().to_string()[..8])
+}
+
+#[tauri::command]
+fn import_python_script(
+    state: State<'_, AppState>,
+    source_path: String,
+) -> Result<ManagedScriptImport, String> {
+    import_python_script_into(&state.managed_scripts_dir, source_path)
+}
+
+fn import_python_script_into(
+    managed_scripts_dir: &Path,
+    source_path: String,
+) -> Result<ManagedScriptImport, String> {
+    let source = PathBuf::from(&source_path)
+        .canonicalize()
+        .map_err(|err| format!("无法读取待导入脚本 {source_path}: {err}"))?;
+    if !source.is_file() {
+        return Err("待导入路径不是文件".to_string());
+    }
+    if !source
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("py"))
+    {
+        return Err("脚本库目前只接受 .py 文件".to_string());
+    }
+
+    let managed_root = managed_scripts_dir
+        .canonicalize()
+        .map_err(|err| format!("无法访问托管脚本库: {err}"))?;
+    if source.starts_with(&managed_root) {
+        return Ok(ManagedScriptImport {
+            script_path: user_path_string(&source),
+            source_path,
+            copied_files: Vec::new(),
+        });
+    }
+
+    let source_dir = source
+        .parent()
+        .ok_or_else(|| "无法确定脚本所在目录".to_string())?;
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| "脚本文件名无效".to_string())?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "脚本文件名不是有效文本".to_string())?;
+    let import_name = managed_script_dir_name(&source);
+    let staging = managed_root.join(format!(".import-{import_name}"));
+    let destination_dir = managed_root.join(&import_name);
+    fs::create_dir(&staging).map_err(|err| format!("创建脚本导入临时目录失败: {err}"))?;
+
+    let import_result = (|| -> anyhow::Result<Vec<String>> {
+        let mut copied = Vec::new();
+        let mut candidates = vec![source.clone()];
+        for name in [
+            format!("{stem}.workbench.json"),
+            format!("{stem}.requirements.txt"),
+            format!("requirements-{stem}.txt"),
+            "requirements.txt".to_string(),
+        ] {
+            let candidate = source_dir.join(name);
+            if candidate.is_file() && !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        for candidate in candidates {
+            let candidate_name = candidate
+                .file_name()
+                .ok_or_else(|| anyhow!("导入文件名无效"))?;
+            fs::copy(&candidate, staging.join(candidate_name))
+                .with_context(|| format!("复制 {} 失败", candidate.to_string_lossy()))?;
+            copied.push(candidate_name.to_string_lossy().into_owned());
+        }
+        fs::rename(&staging, &destination_dir).context("提交托管脚本目录失败")?;
+        Ok(copied)
+    })();
+
+    match import_result {
+        Ok(copied_files) => Ok(ManagedScriptImport {
+            script_path: user_path_string(&destination_dir.join(file_name)),
+            source_path,
+            copied_files,
+        }),
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(error.to_string())
+        }
+    }
 }
 
 #[tauri::command]
@@ -2437,12 +2708,25 @@ async fn start_run_impl(
         &resolved_runtime_values.redacted,
     )
     .map_err(|err| err.to_string())?;
+    // Runs the user already asked to stop (or that a concurrency policy is
+    // replacing) are being reaped in the background by the monitor.  Exclude
+    // them from the active count so "stop then immediately start again" works
+    // even under reject/stop_existing before the old instance is reaped.
+    let stopping_ids: std::collections::HashSet<String> = state
+        .stopping
+        .lock()
+        .map_err(|_| "停止状态锁已损坏".to_string())?
+        .keys()
+        .cloned()
+        .collect();
     let active_runs = state
         .running
         .lock()
         .map_err(|_| "运行状态锁已损坏".to_string())?
         .iter()
-        .filter(|(_, process)| process.task_id == task_id)
+        .filter(|(run_id, process)| {
+            process.task_id == task_id && !stopping_ids.contains(*run_id)
+        })
         .map(|(run_id, process)| (run_id.clone(), process.clone()))
         .collect::<Vec<_>>();
     match concurrency_action(&task.reliability.concurrency_policy, active_runs.len()) {
@@ -2666,6 +2950,17 @@ async fn start_run_impl(
                 ));
                 let _ = update_run_attempt(&db_path, &run_id_for_task, attempt_count);
                 tokio::time::sleep(std::time::Duration::from_secs(retry_delay_seconds)).await;
+
+                // The user may have requested a stop while we were sleeping
+                // before the retry.  Do not launch another attempt in that case.
+                if let Some(stop_during_delay) = stopping
+                    .lock()
+                    .ok()
+                    .and_then(|set| set.get(&run_id_for_task).cloned())
+                {
+                    final_result = ("stopped".to_string(), observed_exit_code, Some(stop_during_delay));
+                    break;
+                }
 
                 match spawn_prepared_command(&prepared_for_task) {
                     Ok(mut next_child) => {
@@ -3125,6 +3420,81 @@ fn regenerate_mobile_pairing_code(state: State<'_, AppState>) -> Result<MobileAp
     mobile_api_status(state.inner()).map_err(|err| err.to_string())
 }
 
+fn read_shared_folders(conn: &Connection) -> anyhow::Result<Vec<SharedFolder>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, label, path FROM mobile_shared_folders ORDER BY label COLLATE NOCASE, path",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SharedFolder {
+            id: row.get(0)?,
+            label: row.get(1)?,
+            path: row.get(2)?,
+        })
+    })?;
+    let mut folders = Vec::new();
+    for row in rows {
+        folders.push(row?);
+    }
+    Ok(folders)
+}
+
+#[tauri::command]
+fn list_shared_folders(state: State<'_, AppState>) -> Result<Vec<SharedFolder>, String> {
+    let conn = open_connection(&state).map_err(|err| err.to_string())?;
+    read_shared_folders(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn add_shared_folder(
+    state: State<'_, AppState>,
+    path: String,
+    label: Option<String>,
+) -> Result<Vec<SharedFolder>, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("共享文件夹路径不能为空".to_string());
+    }
+    let canonical = fs::canonicalize(trimmed)
+        .map_err(|err| format!("无法访问该路径：{err}"))?;
+    if !canonical.is_dir() {
+        return Err("所选路径不是文件夹".to_string());
+    }
+    let canonical_str = canonical.to_string_lossy().to_string();
+    let leaf = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| canonical_str.clone());
+    let label = label
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(leaf);
+    let id = api_server::hash_secret(&canonical_str);
+    let conn = open_connection(&state).map_err(|err| err.to_string())?;
+    conn.execute(
+        "INSERT INTO mobile_shared_folders (id, label, path, created_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET label = excluded.label, path = excluded.path",
+        params![id, label, canonical_str, now_iso()],
+    )
+    .map_err(|err| err.to_string())?;
+    read_shared_folders(&conn).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn remove_shared_folder(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<SharedFolder>, String> {
+    let conn = open_connection(&state).map_err(|err| err.to_string())?;
+    conn.execute(
+        "DELETE FROM mobile_shared_folders WHERE id = ?1",
+        params![id],
+    )
+    .map_err(|err| err.to_string())?;
+    read_shared_folders(&conn).map_err(|err| err.to_string())
+}
+
 #[tauri::command]
 fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
     let conn = open_connection(&state).map_err(|err| err.to_string())?;
@@ -3228,6 +3598,104 @@ fn pick_directory(app: AppHandle, directory: Option<String>) -> Result<Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_python_script_and_sidecar_into_managed_library() {
+        let test_root = std::env::temp_dir().join(format!(
+            "script-workbench-managed-import-{}",
+            Uuid::new_v4()
+        ));
+        let source_dir = test_root.join("source");
+        let managed_dir = test_root.join("managed");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&managed_dir).unwrap();
+        let source = source_dir.join("demo.py");
+        let sidecar = source_dir.join("demo.workbench.json");
+        fs::write(&source, "print('ok')\n").unwrap();
+        fs::write(&sidecar, "{}\n").unwrap();
+
+        let imported = import_python_script_into(
+            &managed_dir,
+            source.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+
+        let imported_path = PathBuf::from(&imported.script_path);
+        assert!(imported_path.is_file());
+        assert!(imported_path.parent().unwrap().join("demo.workbench.json").is_file());
+        assert_eq!(imported.copied_files, vec!["demo.py", "demo.workbench.json"]);
+        assert!(
+            imported_path
+                .canonicalize()
+                .unwrap()
+                .starts_with(managed_dir.canonicalize().unwrap())
+        );
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn managed_paths_are_returned_without_windows_verbatim_prefix() {
+        let path = Path::new(r"\\?\C:\Program Files\Script Workbench\managed-scripts\demo.py");
+        assert_eq!(
+            user_path_string(path),
+            r"C:\Program Files\Script Workbench\managed-scripts\demo.py"
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_managed_scripts_and_task_paths() {
+        let test_root = std::env::temp_dir().join(format!(
+            "script-workbench-managed-migration-{}",
+            Uuid::new_v4()
+        ));
+        let legacy_root = test_root.join("app-data").join("managed-scripts");
+        let managed_root = test_root.join("program").join("managed-scripts");
+        let script_dir = legacy_root.join("demo-12345678");
+        fs::create_dir_all(&script_dir).unwrap();
+        fs::create_dir_all(&managed_root).unwrap();
+        let legacy_script = script_dir.join("demo.py");
+        fs::write(&legacy_script, "print('ok')\n").unwrap();
+        let db_path = test_root.join("workbench.sqlite");
+        database::init_database(&db_path).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO tasks
+             (id, kind, name, working_directory, env_vars_json, tags_json, notes, favorite, created_at, updated_at)
+             VALUES ('task-1', 'python_task', 'Demo', ?1, '[]', '[]', '', 0, 'now', 'now')",
+            [user_path_string(&script_dir)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO python_task_configs
+             (task_id, interpreter_profile_id, script_path, args_template)
+             VALUES ('task-1', 'system-python', ?1, '')",
+            [user_path_string(&legacy_script)],
+        )
+        .unwrap();
+        drop(conn);
+
+        migrate_managed_script_library(&db_path, &legacy_root, &managed_root).unwrap();
+
+        let copied = managed_root.join("demo-12345678").join("demo.py");
+        assert!(copied.is_file());
+        let conn = Connection::open(&db_path).unwrap();
+        let (script_path, working_directory): (String, String) = conn
+            .query_row(
+                "SELECT p.script_path, t.working_directory
+                 FROM python_task_configs p JOIN tasks t ON t.id = p.task_id
+                 WHERE p.task_id = 'task-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(PathBuf::from(script_path), copied);
+        assert_eq!(
+            PathBuf::from(working_directory),
+            managed_root.join("demo-12345678")
+        );
+        drop(conn);
+        fs::remove_dir_all(test_root).unwrap();
+    }
 
     #[test]
     fn replaces_repeated_book_id_in_url_and_output_path() {

@@ -1,18 +1,19 @@
-﻿import { useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { api } from "./lib/api";
 import { AppErrorBoundary } from "./components/AppErrorBoundary";
 import { ChoiceField, SafeMultilineInput, SafeSingleLineInput, SafeToggle } from "./components/SafeFields";
 import { RuntimeParameterEditor } from "./components/RuntimeParameterEditor";
-import { RuntimeParameterFields } from "./components/RuntimeParameterFields";
 import { ScriptScanPreviewModal } from "./components/ScriptScanPreviewModal";
+import { TaskGallery } from "./components/TaskGallery";
+import { TaskRunModal } from "./components/TaskRunModal";
+import { LanShareModal } from "./components/LanShareModal";
 import {
   buildPreviewCommand, cloneTask, createEmptyTask,
-  formatDateTime, formatDuration, getRuntimeTemplate, parseCommaSeparated,
-  resolveTaskWorkingDirectory, taskMatchesSearch,
+  getRuntimeTemplate, parseCommaSeparated,
+  resolveTaskWorkingDirectory,
 } from "./lib/taskUtils";
 import {
   runtimeValuesAfterChange,
@@ -22,8 +23,6 @@ import {
 } from "./lib/runtimeParameters";
 import {
   AppSettings,
-  BundledPythonStatus,
-  InterpreterHealth,
   InterpreterProfile,
   MobileApiSettings,
   MobileApiStatus,
@@ -34,14 +33,11 @@ import {
   RunStreamEvent,
   ScriptScanPreview,
   ScriptScanStatus,
+  SharedFolder,
   TaskKind,
   TaskRecord,
-  ThemeMode,
-  WorkspaceBackup,
 } from "./types";
 import "./styles.css";
-
-type ViewKey = "dashboard" | "tasks" | "runs" | "settings";
 
 type TerminalBuffer = RunOutput & {
   status: string;
@@ -64,103 +60,25 @@ const DEFAULT_MOBILE_API_SETTINGS: MobileApiSettings = {
   port: 17631,
 };
 
-type QrImageInfo = {
-  primaryPath: string;
-  latestPath: string | null;
-};
-
-const QR_IMAGE_PATH_RE = /[A-Za-z]:[\\/][^\r\n'"),]+?\.png/gi;
-
-function normalizeQrPath(path: string): string {
-  return path.replace(/\//g, "\\");
-}
-
-function firstQrPath(line: string): string | null {
-  const matches = line.match(QR_IMAGE_PATH_RE);
-  return matches?.[0] ? normalizeQrPath(matches[0]) : null;
-}
-
-function extractLatestQrImage(output: string): QrImageInfo | null {
-  let primaryPath: string | null = null;
-  let latestPath: string | null = null;
-  for (const rawLine of output.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line.startsWith("QR image:")) {
-      primaryPath = firstQrPath(line) ?? primaryPath;
-    } else if (line.startsWith("QR latest image:")) {
-      latestPath = firstQrPath(line) ?? latestPath;
-    }
-  }
-  if (!primaryPath && !latestPath) return null;
-  return { primaryPath: primaryPath ?? latestPath!, latestPath };
-}
-
-function fileSrcForPreview(path: string): string {
-  try {
-    return convertFileSrc(path);
-  } catch {
-    return `file:///${path.replace(/\\/g, "/")}`;
-  }
-}
-
-function TerminalOutputView({
-  output,
-  emptyText,
-  stream,
-}: {
-  output: string;
-  emptyText: string;
-  stream: "stdout" | "stderr";
-}) {
-  const qrImage = stream === "stdout" ? extractLatestQrImage(output) : null;
-  return (
-    <div className={`terminal-output-wrap ${stream}`}>
-      {qrImage && (
-        <div className="qr-preview-card">
-          <div className="qr-preview-copy">
-            <strong>Telegram 登录二维码</strong>
-            <span>请用手机 Telegram：设置 → 设备 → 连接桌面设备，然后扫描下方二维码并确认登录。</span>
-            <code>{qrImage.primaryPath}</code>
-          </div>
-          <div className="qr-preview-actions">
-            <img
-              className="qr-preview-image"
-              src={fileSrcForPreview(qrImage.primaryPath)}
-              alt="Telegram 登录二维码"
-            />
-            <button
-              type="button"
-              className="secondary-button compact-button"
-              onClick={() => void openPath(qrImage.primaryPath)}
-            >
-              打开二维码图片
-            </button>
-          </div>
-        </div>
-      )}
-      <pre className={`terminal-output ${stream}`}>{output || emptyText}</pre>
-    </div>
-  );
-}
-const WORKSPACE_BACKUP_VERSION = 4;
+const NEW_TASK_MODAL_ID = "__new_task__";
 
 function App() {
-  const [view, setView] = useState<ViewKey>("tasks");
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [interpreters, setInterpreters] = useState<InterpreterProfile[]>([]);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [settingsDraft, setSettingsDraft] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [galleryCategory, setGalleryCategory] = useState<string>("all");
+  const [gallerySearch, setGallerySearch] = useState<string>("");
+  const [runModalTaskId, setRunModalTaskId] = useState<string | null>(null);
+  const [editModalTaskId, setEditModalTaskId] = useState<string | null>(null);
   const [draftTask, setDraftTask] = useState<TaskRecord | null>(null);
   const [taskDirty, setTaskDirty] = useState(false);
   const [commandPreview, setCommandPreview] = useState("");
   const [runtimeValues, setRuntimeValues] = useState<RuntimeValues>({});
-  const [runtimeValuesLoading, setRuntimeValuesLoading] = useState(false);
-  const [runtimePreviewError, setRuntimePreviewError] = useState("");
-  const [taskSearch, setTaskSearch] = useState("");
-  const [statusMessage, setStatusMessage] = useState("准备就绪");
+  const [_runtimeValuesLoading, setRuntimeValuesLoading] = useState(false);
+  const [statusMessage, setStatusMessage] = useState("");
   const [importModalOpen, setImportModalOpen] = useState(false);
   const [importText, setImportText] = useState("");
   const [importWarnings, setImportWarnings] = useState<string[]>([]);
@@ -168,62 +86,25 @@ function App() {
   const [argsEditorOpen, setArgsEditorOpen] = useState(false);
   const [argsEditorDraft, setArgsEditorDraft] = useState("");
   const [runtimeParameterEditorOpen, setRuntimeParameterEditorOpen] = useState(false);
+  const [lanShareModalOpen, setLanShareModalOpen] = useState(false);
   const [terminalBuffers, setTerminalBuffers] = useState<Record<string, TerminalBuffer>>({});
-  const [runOutputLoading, setRunOutputLoading] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isSavingTask, setIsSavingTask] = useState(false);
-  const [newInterpreterName, setNewInterpreterName] = useState("");
-  const [newInterpreterPath, setNewInterpreterPath] = useState("");
-  const [selectedInterpreterHealth, setSelectedInterpreterHealth] =
-    useState<Record<string, InterpreterHealth>>({});
-  const [selectedRunSnapshot, setSelectedRunSnapshot] = useState<RunOutput | null>(null);
-  const [bundledPythonStatus, setBundledPythonStatus] = useState<BundledPythonStatus | null>(null);
-  const [bundledPythonBusy, setBundledPythonBusy] = useState(false);
   const [mobileApiStatus, setMobileApiStatus] = useState<MobileApiStatus | null>(null);
   const [mobileApiDraft, setMobileApiDraft] =
     useState<MobileApiSettings>(DEFAULT_MOBILE_API_SETTINGS);
   const [mobileApiBusy, setMobileApiBusy] = useState(false);
-  const [taskKindFilter, setTaskKindFilter] = useState<"all" | TaskKind>("all");
-  const [favoritesOnly, setFavoritesOnly] = useState(false);
-  const [runSearch, setRunSearch] = useState("");
-  const [runStatusFilter, setRunStatusFilter] = useState("all");
-  const [isClearingRunHistory, setIsClearingRunHistory] = useState(false);
+  const [sharedFolders, setSharedFolders] = useState<SharedFolder[]>([]);
+  const [sharedFolderBusy, setSharedFolderBusy] = useState(false);
   const [scriptScanPreview, setScriptScanPreview] = useState<ScriptScanPreview | null>(null);
   const [scriptScanBusy, setScriptScanBusy] = useState(false);
   const [scriptScanStatus, setScriptScanStatus] = useState<ScriptScanStatus | null>(null);
   const statusTimerRef = useRef<number | null>(null);
   const workspaceRef = useRef<HTMLElement | null>(null);
+  const startingRunTaskRef = useRef<string | null>(null);
+  const stoppingRunRef = useRef<string | null>(null);
   const [activeRunByTask, setActiveRunByTask] = useState<Record<string, string>>({});
 
-  const selectedRun = useMemo(
-    () => runs.find((run) => run.id === selectedRunId) ?? null,
-    [runs, selectedRunId],
-  );
-  const visibleTasks = useMemo(
-    () =>
-      tasks.filter((task) => {
-        if (!taskMatchesSearch(task, taskSearch)) return false;
-        if (taskKindFilter !== "all" && task.kind !== taskKindFilter) return false;
-        if (favoritesOnly && !task.favorite) return false;
-        return true;
-      }),
-    [favoritesOnly, taskKindFilter, taskSearch, tasks],
-  );
-  const visibleRuns = useMemo(
-    () =>
-      runs.filter((run) => {
-        const query = runSearch.trim().toLowerCase();
-        const matchesQuery =
-          !query ||
-          [run.taskName, run.commandPreview, run.workingDirectory, run.status]
-            .join(" ")
-            .toLowerCase()
-            .includes(query);
-        const matchesStatus = runStatusFilter === "all" || run.status === runStatusFilter;
-        return matchesQuery && matchesStatus;
-      }),
-    [runSearch, runStatusFilter, runs],
-  );
   const defaultInterpreterId = useMemo(() => {
     return (
       settingsDraft.defaultInterpreterId ??
@@ -232,20 +113,49 @@ function App() {
       null
     );
   }, [interpreters, settingsDraft.defaultInterpreterId]);
-  const preferredExternalInterpreter = useMemo(
-    () =>
-      interpreters.find((item) => item.type === "external" && item.executablePath) ?? null,
-    [interpreters],
-  );
   const activeRunId = selectedTaskId ? activeRunByTask[selectedTaskId] ?? null : null;
-  const activeTerminal = activeRunId ? terminalBuffers[activeRunId] : null;
+  const modalRunningRuns = runModalTaskId
+    ? runs.filter((run) => run.taskId === runModalTaskId && run.status === "running")
+    : [];
+  const modalRunId = modalRunningRuns[0]?.id
+    ?? (runModalTaskId ? activeRunByTask[runModalTaskId] ?? null : null);
+  const runModalTask = runModalTaskId ? tasks.find((t) => t.id === runModalTaskId) ?? null : null;
+  const editModalTask = editModalTaskId
+    ? tasks.find((t) => t.id === editModalTaskId) ??
+      (editModalTaskId === NEW_TASK_MODAL_ID ? draftTask : null)
+    : null;
+  // A run only counts as "running" while its live status says so.
+  // terminalBuffers is fed by run://stdout|stderr|status events; runs comes from listRuns.
+  const runningRunIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const [runId, buffer] of Object.entries(terminalBuffers)) {
+      if (buffer.status === "running") ids.add(runId);
+    }
+    for (const run of runs) {
+      if (run.status === "running") ids.add(run.id);
+    }
+    return ids;
+  }, [runs, terminalBuffers]);
+  const runningTaskIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const run of runs) {
+      if (run.taskId && runningRunIds.has(run.id)) ids.add(run.taskId);
+    }
+    return ids;
+  }, [runningRunIds, runs]);
+  const runningTaskCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const run of runs) {
+      if (run.taskId && runningRunIds.has(run.id)) {
+        counts[run.taskId] = (counts[run.taskId] ?? 0) + 1;
+      }
+    }
+    return counts;
+  }, [runningRunIds, runs]);
+  const modalIsRunning = Boolean(modalRunId && runningRunIds.has(modalRunId));
   const activeRunTaskName = activeRunId
     ? runs.find((run) => run.id === activeRunId)?.taskName ?? null
     : null;
-  const taskTerminalRuns = useMemo(
-    () => selectedTaskId ? runs.filter((run) => run.taskId === selectedTaskId) : [],
-    [runs, selectedTaskId],
-  );
   const runtimeParameters = useMemo(
     () => syncRuntimeParameters(
       getRuntimeTemplate(draftTask),
@@ -272,21 +182,21 @@ function App() {
       window.clearTimeout(statusTimerRef.current);
     }
     statusTimerRef.current = window.setTimeout(() => {
-      setStatusMessage("准备就绪");
+      setStatusMessage("");
     }, 2400);
   }
 
   async function loadWorkspace() {
     setIsLoading(true);
     try {
-      const [taskList, runList, interpreterList, loadedSettings, loadedMobileApiStatus] = await Promise.all([
+      const [taskList, runList, interpreterList, loadedSettings, loadedMobileApiStatus, loadedSharedFolders] = await Promise.all([
         api.listTasks(),
         api.listRuns(),
         api.listInterpreterProfiles(),
         api.getSettings(),
         api.getMobileApiStatus(),
+        api.listSharedFolders(),
       ]);
-      const bundledStatus = await api.getBundledPythonStatus();
       setTasks(taskList);
       setRuns(runList);
       rememberLatestTaskRuns(runList);
@@ -294,17 +204,14 @@ function App() {
       setSettings(loadedSettings);
       setSettingsDraft(loadedSettings);
       setMobileApiStatus(loadedMobileApiStatus);
+      setSharedFolders(loadedSharedFolders);
       setMobileApiDraft({
         enabled: loadedMobileApiStatus.enabled,
         bindHost: loadedMobileApiStatus.bindHost,
         port: loadedMobileApiStatus.port,
       });
-      setBundledPythonStatus(bundledStatus);
       if (!selectedTaskId && taskList.length > 0) {
         setSelectedTaskId(taskList[0].id);
-      }
-      if (!selectedRunId && runList.length > 0) {
-        setSelectedRunId(runList[0].id);
       }
     } catch (error) {
       console.error(error);
@@ -331,99 +238,34 @@ function App() {
     const runList = await api.listRuns();
     setRuns(runList);
     rememberLatestTaskRuns(runList);
-    if (!selectedRunId && runList[0]) {
-      setSelectedRunId(runList[0].id);
-    }
-  }
-
-  async function handleClearRunHistory() {
-    const historyCount = runs.filter((run) => run.status !== "running").length;
-    if (historyCount === 0) {
-      flashStatus("没有可清除的历史运行记录");
-      return;
-    }
-    const runningCount = runs.length - historyCount;
-    const runningNotice = runningCount > 0
-      ? `\n\n当前有 ${runningCount} 个运行中实例，它们不会被停止或清除。`
-      : "";
-    if (!window.confirm(
-      `确定清除 ${historyCount} 条历史运行记录及其日志吗？此操作不可撤销。${runningNotice}`,
-    )) {
-      return;
-    }
-
-    setIsClearingRunHistory(true);
-    try {
-      const result = await api.clearRunHistory();
-      const remainingRuns = await api.listRuns();
-      const remainingIds = new Set(remainingRuns.map((run) => run.id));
-      const nextActiveRunByTask: Record<string, string> = {};
-      for (const run of remainingRuns) {
-        if (run.taskId && !nextActiveRunByTask[run.taskId]) {
-          nextActiveRunByTask[run.taskId] = run.id;
-        }
-      }
-
-      setRuns(remainingRuns);
-      setSelectedRunId((current) =>
-        current && remainingIds.has(current) ? current : remainingRuns[0]?.id ?? null,
-      );
-      setSelectedRunSnapshot(null);
-      setTerminalBuffers((current) =>
-        Object.fromEntries(
-          Object.entries(current).filter(([runId]) => remainingIds.has(runId)),
-        ),
-      );
-      setActiveRunByTask(nextActiveRunByTask);
-
-      const logWarning = result.failedLogCount > 0
-        ? `；${result.failedLogCount} 个日志文件未能删除`
-        : "";
-      flashStatus(`已清除 ${result.deletedCount} 条历史运行记录${logWarning}`);
-    } catch (error) {
-      setStatusMessage(`清除运行记录失败: ${String(error)}`);
-    } finally {
-      setIsClearingRunHistory(false);
-    }
   }
 
   function rememberLatestTaskRuns(runList: RunRecord[]) {
+    // runList is ordered newest-first; compute the newest run per task.
+    const newestByTask: Record<string, string> = {};
+    for (const run of runList) {
+      if (run.taskId && newestByTask[run.taskId] === undefined) {
+        newestByTask[run.taskId] = run.id;
+      }
+    }
     setActiveRunByTask((current) => {
       const next = { ...current };
-      for (const run of runList) {
-        if (run.taskId && !next[run.taskId]) next[run.taskId] = run.id;
+      let changed = false;
+      for (const [taskId, runId] of Object.entries(newestByTask)) {
+        if (next[taskId] !== runId) {
+          next[taskId] = runId;
+          changed = true;
+        }
       }
-      return next;
+      return changed ? next : current;
     });
   }
 
-  function selectTaskTerminalRun(run: RunRecord) {
-    if (!run.taskId || !tasks.some((task) => task.id === run.taskId)) {
-      setStatusMessage("该运行记录对应的任务已被删除，请在运行详情中查看日志。");
-      return;
-    }
-    setSelectedTaskId(run.taskId);
-    setActiveRunByTask((current) => ({ ...current, [run.taskId!]: run.id }));
-    setView("tasks");
-  }
-
-  async function refreshInterpreters() {
-    const interpreterList = await api.listInterpreterProfiles();
-    setInterpreters(interpreterList);
-  }
-
-  async function refreshBundledPythonStatus() {
-    const status = await api.getBundledPythonStatus();
-    setBundledPythonStatus(status);
-  }
-
-  function attachRunToUi(run: RunRecord, nextView: ViewKey = "tasks") {
+  function attachRunToUi(run: RunRecord) {
     const taskId = run.taskId ?? selectedTaskId;
     if (taskId) {
       setActiveRunByTask((current) => ({ ...current, [taskId]: run.id }));
     }
-    setSelectedRunId(run.id);
-    setView(nextView);
     setTerminalBuffers((current) => ({
       ...current,
       [run.id]: current[run.id] ?? {
@@ -523,7 +365,6 @@ function App() {
   useEffect(() => {
     const fallbackPreview = buildPreviewCommand(draftTask, interpreters);
     setCommandPreview(fallbackPreview);
-    setRuntimePreviewError("");
     if (!draftTask || missingRuntimeVariables.length > 0) return;
     let active = true;
     const timer = window.setTimeout(() => {
@@ -532,8 +373,7 @@ function App() {
         .then((preview) => {
           if (active) setCommandPreview(preview || fallbackPreview);
         })
-        .catch((error) => {
-          if (active) setRuntimePreviewError(String(error));
+        .catch(() => {
         });
     }, 120);
     return () => {
@@ -541,26 +381,6 @@ function App() {
       window.clearTimeout(timer);
     };
   }, [draftTask, interpreters, runtimeValues, missingRuntimeVariables.join("|")]);
-
-  useEffect(() => {
-    if (!selectedRunId) {
-      setSelectedRunSnapshot(null);
-      return;
-    }
-    const cached = terminalBuffers[selectedRunId];
-    if (cached) {
-      setSelectedRunSnapshot({
-        stdout: cached.stdout,
-        stderr: cached.stderr,
-      });
-      return;
-    }
-    setRunOutputLoading(true);
-    api
-      .getRunOutput(selectedRunId)
-      .then((output) => setSelectedRunSnapshot(output))
-      .finally(() => setRunOutputLoading(false));
-  }, [selectedRunId, terminalBuffers]);
 
   useEffect(() => {
     if (!activeRunId || terminalBuffers[activeRunId]) return;
@@ -679,7 +499,7 @@ function App() {
 
   useEffect(() => {
     workspaceRef.current?.scrollTo?.({ top: 0, left: 0 });
-  }, [view]);
+  }, [selectedTaskId]);
 
   function updateDraftTask(updater: (current: TaskRecord) => TaskRecord) {
     setDraftTask((current) => {
@@ -693,6 +513,27 @@ function App() {
       return next;
     });
     setTaskDirty(true);
+  }
+
+  function isManagedScriptPath(scriptPath: string): boolean {
+    return /[\\/]managed-scripts[\\/]/i.test(scriptPath);
+  }
+
+  async function prepareTaskScript(task: TaskRecord): Promise<TaskRecord> {
+    const scriptPath = task.python?.scriptPath?.trim();
+    if (task.kind !== "python_task" || !task.python || !scriptPath || isManagedScriptPath(scriptPath)) {
+      return task;
+    }
+    const imported = await api.importPythonScript(scriptPath);
+    const managedDirectory = imported.scriptPath.replace(/[\\/][^\\/]+$/, "");
+    const prepared = cloneTask(task);
+    prepared.workingDirectory = managedDirectory;
+    prepared.python = {
+      ...prepared.python!,
+      scriptPath: imported.scriptPath,
+    };
+    flashStatus("已将脚本复制到托管脚本库");
+    return prepared;
   }
 
   async function handleCopyText(label: string, text: string) {
@@ -710,7 +551,9 @@ function App() {
     }
     setIsSavingTask(true);
     try {
-      const savedTask = await api.saveTask(draftTask);
+      const preparedTask = await prepareTaskScript(draftTask);
+      setDraftTask(preparedTask);
+      const savedTask = await api.saveTask(preparedTask);
       flashStatus("任务已保存");
       await refreshTasks();
       setSelectedTaskId(savedTask.id);
@@ -727,25 +570,44 @@ function App() {
     if (!draftTask?.id) {
       setDraftTask(createEmptyTask("python_task", defaultInterpreterId));
       setTaskDirty(false);
+      setEditModalTaskId(null);
       return;
     }
-    if (!window.confirm(`确认删除任务“${draftTask.name || "未命名任务"}”吗？`)) {
+    if (!(await confirmDialog(`确认删除任务“${draftTask.name || "未命名任务"}”吗？`))) {
       return;
     }
+    const taskId = draftTask.id;
     try {
-      await api.deleteTask(draftTask.id);
+      await api.deleteTask(taskId);
+      setActiveRunByTask((current) => {
+        if (!(taskId in current)) return current;
+        const next = { ...current };
+        delete next[taskId];
+        return next;
+      });
       flashStatus("任务已删除");
+      // Immediately drop every UI reference to the deleted task. Keeping the
+      // stale draftTask would let a later click on run resurrect the task
+      // through ensureTaskSaved (draftTask.id still exists, taskDirty=false),
+      // or leave a ghost editor open for the last remaining task.
+      setEditModalTaskId((current) => (current === taskId ? null : current));
+      setRunModalTaskId((current) => (current === taskId ? null : current));
+      setDraftTask(null);
+      setTaskDirty(false);
+      setRuntimeValues({});
+      setRuntimeValuesLoading(false);
       await refreshTasks();
+      await refreshRuns();
     } catch (error) {
       setStatusMessage(`删除失败: ${String(error)}`);
     }
   }
-
   function handleNewTask(kind: TaskKind) {
     setSelectedTaskId(null);
+    setRunModalTaskId(null);
+    setEditModalTaskId(NEW_TASK_MODAL_ID);
     setDraftTask(createEmptyTask(kind, defaultInterpreterId));
     setTaskDirty(true);
-    setView("tasks");
     setRuntimeValues({});
     setRuntimeValuesLoading(false);
   }
@@ -763,6 +625,7 @@ function App() {
       setDraftTask(importedTask);
       setTaskDirty(true);
       setSelectedTaskId(null);
+      setEditModalTaskId(NEW_TASK_MODAL_ID);
       setImportModalOpen(false);
       flashStatus("已导入命令草稿");
     } catch (error) {
@@ -772,10 +635,13 @@ function App() {
 
   async function ensureTaskSaved(): Promise<string | null> {
     if (!draftTask) return null;
-    if (!taskDirty && draftTask.id) return draftTask.id;
+    const preparedTask = await prepareTaskScript(draftTask);
+    if (!taskDirty && preparedTask.id && preparedTask.python?.scriptPath === draftTask.python?.scriptPath) {
+      return preparedTask.id;
+    }
     setIsSavingTask(true);
     try {
-      const savedTask = await api.saveTask(draftTask);
+      const savedTask = await api.saveTask(preparedTask);
       await refreshTasks();
       setSelectedTaskId(savedTask.id);
       setDraftTask(cloneTask(savedTask));
@@ -789,23 +655,62 @@ function App() {
     }
   }
 
+  function openRunModal(task: TaskRecord) {
+    if (!task.id) return;
+    setSelectedTaskId(task.id);
+    setRunModalTaskId(task.id);
+  }
+
+  function closeRunModal() {
+    setRunModalTaskId(null);
+  }
+
+  function openEditModal(task: TaskRecord) {
+    if (!task.id) return;
+    setSelectedTaskId(task.id);
+    setEditModalTaskId(task.id);
+  }
+
+  function closeEditModal() {
+    setEditModalTaskId(null);
+  }
+
+  async function handleToggleFavorite(taskId: string) {
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task) return;
+    const updated = { ...task, favorite: !task.favorite };
+    try {
+      await api.saveTask(updated);
+      await refreshTasks();
+      flashStatus(updated.favorite ? "已收藏" : "已取消收藏");
+    } catch (error) {
+      setStatusMessage(`收藏失败: ${String(error)}`);
+    }
+  }
+
   async function handleStartRun() {
+    if (startingRunTaskRef.current) {
+      return;
+    }
     const taskId = await ensureTaskSaved();
     if (!taskId) {
       return;
     }
+    startingRunTaskRef.current = taskId;
     try {
       if (missingRuntimeVariables.length > 0) {
         setStatusMessage(`请填写运行参数: ${missingRuntimeVariables.join("、")}`);
         return;
       }
       const run = await api.startRun(taskId, runtimeValues);
-      attachRunToUi(run, "tasks");
+      attachRunToUi(run);
       await refreshRuns();
       flashStatus(`已启动任务：${draftTask?.name || "未命名任务"}`);
     } catch (error) {
       setStatusMessage(`运行失败: ${String(error)}`);
       await refreshRuns();
+    } finally {
+      startingRunTaskRef.current = null;
     }
   }
 
@@ -813,22 +718,65 @@ function App() {
     runId: string | null = activeRunId,
     runTaskName: string | null = activeRunTaskName,
   ) {
-    if (!runId) {
+    if (!runId || stoppingRunRef.current === runId) {
       return;
     }
-    const taskName = runTaskName || "当前任务";
-    const runLabel = runId.slice(0, 8);
-    if (
-      settings.confirmBeforeStop &&
-      !window.confirm(`确认停止「${taskName}」运行实例 ${runLabel} 吗？`)
-    ) {
-      return;
-    }
+    stoppingRunRef.current = runId;
     try {
+      const taskName = runTaskName || "当前任务";
+      const runLabel = runId.slice(0, 8);
+      if (
+        settings.confirmBeforeStop &&
+        !(await confirmDialog(`确认停止「${taskName}」运行实例 ${runLabel} 吗？`))
+      ) {
+        return;
+      }
       await api.stopRun(runId);
+      // Immediately reflect the requested stop in local UI state. The
+      // authoritative run://status event normally arrives within tens of
+      // milliseconds, but if it is missed the modal button would otherwise
+      // stay stuck on "停止运行" even though the process tree
+      // has already been terminated.
+      setRuns((current) =>
+        current.map((run) =>
+          run.id === runId && run.status === "running"
+            ? { ...run, status: "stopped" }
+            : run,
+        ),
+      );
+      setTerminalBuffers((current) => {
+        const buffer = current[runId];
+        if (!buffer || buffer.status !== "running") return current;
+        return { ...current, [runId]: { ...buffer, status: "stopped" } };
+      });
+      // Reconcile with the database as a fallback in case the status event
+      // was emitted before our listener was ready.
+      window.setTimeout(() => {
+        void refreshRuns().catch(() => undefined);
+      }, 350);
       flashStatus(`已向「${taskName}」实例 ${runLabel} 发送停止信号`);
     } catch (error) {
+      // The process may have already exited between the click and the backend
+      // lookup (or a second stop raced with the first). Reconcile against the
+      // database before showing a failure so we do not claim "停止失败" for a
+      // run that is already finished/stopped.
+      try {
+        const latest = await api.listRuns();
+        setRuns(latest);
+        rememberLatestTaskRuns(latest);
+        const run = latest.find((item) => item.id === runId);
+        if (run && run.status !== "running") {
+          flashStatus(`任务已结束，状态: ${run.status}`);
+          return;
+        }
+      } catch {
+        // Ignore refresh failures and fall through to the error message.
+      }
       setStatusMessage(`停止失败: ${String(error)}`);
+    } finally {
+      if (stoppingRunRef.current === runId) {
+        stoppingRunRef.current = null;
+      }
     }
   }
 
@@ -883,22 +831,34 @@ function App() {
   async function chooseScriptFile() {
     const picked = await api.pickFile(draftTask?.workingDirectory || undefined);
     if (!picked) return;
-    updateDraftTask((current) => ({
-      ...current,
-      python: current.python
-        ? {
-            ...current.python,
-            scriptPath: picked,
-          }
-        : current.python,
-    }));
-    await startScriptScan(picked, false);
+    try {
+      const imported = await api.importPythonScript(picked);
+      const managedDirectory = imported.scriptPath.replace(/[\\/][^\\/]+$/, "");
+      updateDraftTask((current) => ({
+        ...current,
+        workingDirectory: managedDirectory,
+        python: current.python
+          ? {
+              ...current.python,
+              scriptPath: imported.scriptPath,
+            }
+          : current.python,
+      }));
+      await startScriptScan(imported.scriptPath, false);
+      flashStatus(
+        imported.copiedFiles.length > 0
+          ? `已复制到软件脚本库：${imported.copiedFiles.join("、")}`
+          : "脚本已位于软件脚本库",
+      );
+    } catch (error) {
+      setStatusMessage(`脚本导入失败: ${String(error)}`);
+    }
   }
 
   async function handleHelpRescan() {
     const path = draftTask?.python?.scriptPath;
     if (!path) return;
-    if (!window.confirm("将启动该脚本的 --help 扫描，最长 3 秒。继续吗？")) return;
+    if (!(await confirmDialog("将启动该脚本的 --help 扫描，最长 3 秒。继续吗？"))) return;
     await startScriptScan(path, true);
   }
 
@@ -984,12 +944,6 @@ function App() {
     setRuntimeValues((current) => ({ ...current, [name]: picked }));
   }
 
-  async function chooseInterpreterPath() {
-    const picked = await api.pickFile(newInterpreterPath || undefined);
-    if (!picked) return;
-    setNewInterpreterPath(picked);
-  }
-
   function openArgsEditor() {
     setArgsEditorDraft(draftTask?.python?.argsTemplate ?? "");
     setArgsEditorOpen(true);
@@ -1043,149 +997,6 @@ function App() {
     }
   }
 
-  async function handleRevealRunLog(kind: "stdout" | "stderr") {
-    const targetPath =
-      kind === "stdout" ? selectedRun?.stdoutLogPath : selectedRun?.stderrLogPath;
-    if (!targetPath) {
-      flashStatus("当前运行记录没有对应日志");
-      return;
-    }
-    try {
-      await revealItemInDir(targetPath);
-    } catch (error) {
-      setStatusMessage(`无法定位日志: ${String(error)}`);
-    }
-  }
-
-  async function handleOpenSelectedRunDirectory() {
-    const directory = selectedRun?.workingDirectory;
-    if (!directory) {
-      flashStatus("当前运行记录没有工作目录");
-      return;
-    }
-    try {
-      await openPath(directory);
-    } catch (error) {
-      setStatusMessage(`无法打开运行目录: ${String(error)}`);
-    }
-  }
-
-  async function handleRerunSelectedTask() {
-    if (!selectedRun?.taskId) {
-      flashStatus("这条运行记录没有可重跑的任务");
-      return;
-    }
-    try {
-      const run = await api.startRun(selectedRun.taskId, selectedRun.runtimeValues ?? {});
-      attachRunToUi(run, "tasks");
-      await refreshRuns();
-      flashStatus("已从运行记录重新启动任务");
-    } catch (error) {
-      setStatusMessage(`重跑失败: ${String(error)}`);
-    }
-  }
-
-  async function handleExportWorkspace() {
-    try {
-      const destination = await saveDialog({
-        defaultPath: "script-workbench-backup.json",
-        filters: [{ name: "JSON", extensions: ["json"] }],
-      });
-      if (!destination) return;
-      const payload: WorkspaceBackup = {
-        version: WORKSPACE_BACKUP_VERSION,
-        exportedAt: new Date().toISOString(),
-        tasks,
-        interpreters,
-        settings: settingsDraft,
-      };
-      await api.writeTextFile(destination, JSON.stringify(payload, null, 2));
-      flashStatus(`工作区已导出到 ${destination}`);
-    } catch (error) {
-      setStatusMessage(`导出失败: ${String(error)}`);
-    }
-  }
-
-  async function handleImportWorkspace() {
-    try {
-      const selected = await openDialog({
-        multiple: false,
-        filters: [{ name: "JSON", extensions: ["json"] }],
-      });
-      if (!selected || Array.isArray(selected)) return;
-      if (!window.confirm("导入会把备份中的任务和解释器合并到当前工作区，继续吗？")) {
-        return;
-      }
-
-      const rawText = await api.readTextFile(selected);
-      const backup = JSON.parse(rawText) as Partial<WorkspaceBackup>;
-      if (!Array.isArray(backup.tasks) || !Array.isArray(backup.interpreters)) {
-        throw new Error("备份文件格式不正确");
-      }
-      if (backup.version !== undefined && ![1, 2, 3, 4].includes(backup.version)) {
-        throw new Error(`暂不支持工作区备份版本 ${backup.version}`);
-      }
-
-      const nonDefaultProfiles = backup.interpreters.filter((item) => !item.isDefault);
-      const defaultProfiles = backup.interpreters.filter((item) => item.isDefault);
-      for (const profile of [...nonDefaultProfiles, ...defaultProfiles]) {
-        await api.saveInterpreterProfile(profile);
-      }
-      if (backup.settings) {
-        await api.saveSettings(backup.settings);
-      }
-      for (const task of backup.tasks) {
-        const normalizedTask = cloneTask(task);
-        if ((backup.version ?? 3) < 4 && normalizedTask.python) {
-          normalizedTask.python.argumentMode = "template";
-          normalizedTask.python.argumentRules = [];
-          normalizedTask.python.validationRules = [];
-          normalizedTask.python.scriptHash = null;
-          normalizedTask.python.scanSnapshot = null;
-        }
-        await api.saveTask(normalizedTask);
-      }
-
-      await loadWorkspace();
-      flashStatus(
-        `已导入 ${backup.tasks.length} 个任务，${backup.interpreters.length} 个解释器`,
-      );
-    } catch (error) {
-      setStatusMessage(`导入失败: ${String(error)}`);
-    }
-  }
-
-  async function handleInstallBundledPython(sourcePath?: string) {
-    try {
-      let resolvedSource = sourcePath;
-      if (!resolvedSource) {
-        const picked = await api.pickFile(undefined);
-        if (!picked) return;
-        resolvedSource = picked;
-      }
-      setBundledPythonBusy(true);
-      const status = await api.installBundledPython(resolvedSource);
-      setBundledPythonStatus(status);
-      await refreshInterpreters();
-      flashStatus("bundled Python 已安装");
-    } catch (error) {
-      setStatusMessage(`安装 bundled Python 失败: ${String(error)}`);
-    } finally {
-      setBundledPythonBusy(false);
-    }
-  }
-
-  async function handleSaveSettings() {
-    try {
-      const saved = await api.saveSettings(settingsDraft);
-      setSettings(saved);
-      setSettingsDraft(saved);
-      flashStatus("设置已保存");
-    } catch (error) {
-      setStatusMessage(`设置保存失败: ${String(error)}`);
-    }
-  }
-
   async function handleSaveMobileApiSettings() {
     setMobileApiBusy(true);
     try {
@@ -1204,6 +1015,24 @@ function App() {
     }
   }
 
+  async function handleToggleLanShare(enabled: boolean) {
+    setMobileApiBusy(true);
+    try {
+      const saved = await api.saveMobileApiSettings({ ...mobileApiDraft, enabled });
+      setMobileApiStatus(saved);
+      setMobileApiDraft({
+        enabled: saved.enabled,
+        bindHost: saved.bindHost,
+        port: saved.port,
+      });
+      flashStatus(saved.serverRunning ? "局域网共享已开启" : "局域网共享已停止");
+    } catch (error) {
+      setStatusMessage(`局域网共享操作失败: ${String(error)}`);
+    } finally {
+      setMobileApiBusy(false);
+    }
+  }
+
   async function handleRegenerateMobilePairingCode() {
     setMobileApiBusy(true);
     try {
@@ -1217,358 +1046,115 @@ function App() {
     }
   }
 
-  async function handleSaveInterpreter(defaultMode = false, profile?: InterpreterProfile) {
+  async function handleAddSharedFolder() {
+    setSharedFolderBusy(true);
     try {
-      const baseProfile =
-        profile ?? {
-          id: "",
-          name: newInterpreterName || "自定义解释器",
-          type: "external" as const,
-          executablePath: newInterpreterPath,
-          isDefault: defaultMode,
-        };
-      const saved = await api.saveInterpreterProfile({
-        ...baseProfile,
-        isDefault: defaultMode || baseProfile.isDefault,
-      });
-      setNewInterpreterName("");
-      setNewInterpreterPath("");
-      if (saved.isDefault) {
-        setSettingsDraft((current) => ({ ...current, defaultInterpreterId: saved.id }));
+      const selected = await openDialog({ directory: true, multiple: false });
+      if (typeof selected !== "string" || !selected) {
+        return;
       }
-      await refreshInterpreters();
-      flashStatus("解释器配置已保存");
+      const folders = await api.addSharedFolder(selected);
+      setSharedFolders(folders);
+      flashStatus("共享文件夹已添加");
     } catch (error) {
-      setStatusMessage(`解释器保存失败: ${String(error)}`);
+      setStatusMessage(`添加共享文件夹失败: ${String(error)}`);
+    } finally {
+      setSharedFolderBusy(false);
     }
   }
 
-  async function handleDeleteInterpreter(profileId: string) {
-    if (!window.confirm("确认删除这个解释器配置吗？")) {
-      return;
-    }
+  async function handleRemoveSharedFolder(id: string) {
+    setSharedFolderBusy(true);
     try {
-      await api.deleteInterpreterProfile(profileId);
-      await refreshInterpreters();
-      flashStatus("解释器已删除");
+      const folders = await api.removeSharedFolder(id);
+      setSharedFolders(folders);
+      flashStatus("共享文件夹已移除");
     } catch (error) {
-      setStatusMessage(`解释器删除失败: ${String(error)}`);
+      setStatusMessage(`移除共享文件夹失败: ${String(error)}`);
+    } finally {
+      setSharedFolderBusy(false);
     }
   }
-
-  async function handleCheckInterpreter(profileId: string) {
-    try {
-      const health = await api.checkInterpreterHealth(profileId);
-      setSelectedInterpreterHealth((current) => ({ ...current, [profileId]: health }));
-    } catch (error) {
-      setStatusMessage(`解释器检测失败: ${String(error)}`);
-    }
-  }
-
-  const dashboardStats = useMemo(() => {
-    const runningCount = runs.filter((run) => run.status === "running").length;
-    const failedCount = runs.filter((run) => run.status === "failed").length;
-    const favoriteCount = tasks.filter((task) => task.favorite).length;
-    return {
-      totalTasks: tasks.length,
-      runningCount,
-      failedCount,
-      favoriteCount,
-    };
-  }, [runs, tasks]);
 
   return (
     <AppErrorBoundary>
     <div className="shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">SW</div>
-          <div>
-            <h1>Script Workbench</h1>
-            <p>内置终端的脚本工作台</p>
-          </div>
-        </div>
-
-        <nav className="nav">
-          {[
-            ["dashboard", "概览"],
-            ["tasks", "任务库"],
-            ["runs", "运行记录"],
-            ["settings", "设置"],
-          ].map(([key, label]) => (
-            <button
-              key={key}
-              className={`nav-button ${view === key ? "active" : ""}`}
-              onClick={() => setView(key as ViewKey)}
-            >
-              {label}
-            </button>
-          ))}
-        </nav>
-
-        <section className="sidebar-meta">
-          <div>
-            <span>任务</span>
-            <strong>{tasks.length}</strong>
-          </div>
-          <div>
-            <span>运行中</span>
-            <strong>{dashboardStats.runningCount}</strong>
-          </div>
-          <div>
-            <span>默认解释器</span>
-            <strong>
-              {interpreters.find((item) => item.id === defaultInterpreterId)?.name ?? "未配置"}
-            </strong>
-          </div>
-        </section>
-      </aside>
 
       <main ref={workspaceRef} className="workspace" data-layout-boundary="workspace">
-        <header className="topbar" data-scroll-behavior="flow">
-          <div>
-            <h2>
-              {view === "dashboard" && "概览"}
-              {view === "tasks" && "任务库"}
-              {view === "runs" && "运行记录"}
-              {view === "settings" && "设置"}
-            </h2>
-            <p>{statusMessage}</p>
-          </div>
-          <div className="topbar-actions">
-            {view === "tasks" && draftTask && (
-              <button
-                className="primary-button persistent-run-button"
-                disabled={
-                  isSavingTask ||
-                  runtimeValuesLoading ||
-                  missingRuntimeVariables.length > 0
-                }
-                title={
-                  missingRuntimeVariables.length > 0
-                    ? `请先填写：${missingRuntimeVariables.join("、")}`
-                    : "使用本次运行参数启动当前任务"
-                }
-                onClick={() => void handleStartRun()}
-              >
-                {isSavingTask
-                  ? "保存中..."
-                  : "开始运行"}
-              </button>
-            )}
-            <button className="ghost-button" onClick={() => void loadWorkspace()}>
-              刷新
-            </button>
-            {view === "tasks" && (
-              <>
-                <button className="secondary-button" onClick={() => handleNewTask("python_task")}>
-                  新建 Python
-                </button>
-                <button
-                  className="secondary-button"
-                  onClick={() => handleNewTask("command_task")}
-                >
-                  新建命令
-                </button>
-                <button className="ghost-button" onClick={() => setImportModalOpen(true)}>
-                  导入命令
-                </button>
-              </>
-            )}
-          </div>
-        </header>
-
         {isLoading ? (
           <section className="panel loading-panel">正在加载工作区...</section>
         ) : (
           <>
-            {view === "dashboard" && (
-              <section className="dashboard-grid">
-                <div className="panel stat-card">
-                  <span>总任务数</span>
-                  <strong>{dashboardStats.totalTasks}</strong>
-                </div>
-                <div className="panel stat-card">
-                  <span>运行中任务</span>
-                  <strong>{dashboardStats.runningCount}</strong>
-                </div>
-                <div className="panel stat-card">
-                  <span>失败记录</span>
-                  <strong>{dashboardStats.failedCount}</strong>
-                </div>
-                <div className="panel stat-card">
-                  <span>收藏任务</span>
-                  <strong>{dashboardStats.favoriteCount}</strong>
-                </div>
-                <div className="panel wide-card">
-                  <h3>最近运行</h3>
-                  <div className="table-list">
-                    {runs.slice(0, 6).map((run) => (
-                      <button
-                        key={run.id}
-                        className="table-row clickable"
-                        onClick={() => {
-                          setSelectedRunId(run.id);
-                          setView("runs");
-                        }}
-                      >
-                        <span>{run.taskName || "已删除任务"}</span>
-                        <span className={`status-pill ${run.status}`}>{run.status}</span>
-                        <span>{formatDateTime(run.startedAt)}</span>
-                      </button>
-                    ))}
-                    {runs.length === 0 && <p className="muted">还没有运行记录。</p>}
-                  </div>
-                </div>
-                <div className="panel wide-card">
-                  <h3>最近任务</h3>
-                  <div className="table-list">
-                    {tasks.slice(0, 6).map((task) => (
-                      <button
-                        key={task.id ?? task.name}
-                        className="table-row clickable"
-                        onClick={() => {
-                          setSelectedTaskId(task.id);
-                          setView("tasks");
-                        }}
-                      >
-                        <span>{task.name || "未命名任务"}</span>
-                        <span>{task.kind === "python_task" ? "Python" : "命令"}</span>
-                        <span>{task.favorite ? "收藏" : "普通"}</span>
-                      </button>
-                    ))}
-                    {tasks.length === 0 && <p className="muted">先创建一个任务。</p>}
-                  </div>
-                </div>
-              </section>
+            <TaskGallery
+              tasks={tasks}
+              search={gallerySearch}
+              onSearch={setGallerySearch}
+              selectedCategory={galleryCategory}
+              onSelectCategory={setGalleryCategory}
+              onRun={openRunModal}
+              onEdit={openEditModal}
+              onToggleFavorite={(id) => void handleToggleFavorite(id)}
+              onNewTask={() => handleNewTask("python_task")}
+              onNewCommand={() => handleNewTask("command_task")}
+              onRefresh={() => void refreshTasks()}
+              runningTaskIds={runningTaskIds}
+              runningTaskCounts={runningTaskCounts}
+              lanShareActive={Boolean(mobileApiStatus?.serverRunning)}
+              onOpenLanShare={() => setLanShareModalOpen(true)}
+            />
+            {runModalTask && (
+              <TaskRunModal
+                task={runModalTask}
+                parameters={runtimeParameters}
+                values={runtimeValues}
+                errors={runtimeValueErrors}
+                commandPreview={commandPreview}
+                onValueChange={handleRuntimeValueChange}
+                onPickPath={chooseRuntimePath}
+                onRun={() => void handleStartRun()}
+                onStop={() => void handleStopRun(modalRunId, runModalTask?.name ?? null)}
+                onEditConfig={() => {
+                  const task = runModalTask;
+                  closeRunModal();
+                  if (task) openEditModal(task);
+                }}
+                onClose={closeRunModal}
+                isRunning={modalIsRunning}
+                runningCount={modalRunningRuns.length}
+                allowConcurrentStart={
+                  (runModalTask.reliability?.concurrencyPolicy ?? "allow") === "allow"
+                }
+                runStatus={modalRunId ? terminalBuffers[modalRunId]?.status ?? "" : ""}
+                stdout={modalRunId ? terminalBuffers[modalRunId]?.stdout ?? "" : ""}
+                stderr={modalRunId ? terminalBuffers[modalRunId]?.stderr ?? "" : ""}
+              />
             )}
 
-            {view === "tasks" && (
-              <section className="tasks-layout">
-                <div className="panel task-list-panel">
-                  <div className="panel-header">
+            {editModalTask && (
+              <div className="modal-backdrop" onClick={closeEditModal}>
+                <div className="modal-card task-edit-modal" onClick={(e) => e.stopPropagation()}>
+                  <div className="task-edit-modal-header">
                     <div>
-                      <h3>任务列表</h3>
-                      <p className="muted">按名称、标签、类型和收藏状态筛选。</p>
+                      <h3>{draftTask?.name || "任务配置"}</h3>
+                      <p className="muted">
+                        {draftTask?.kind === "python_task" ? "结构化 Python 任务" : draftTask?.kind === "command_task" ? "原始命令任务" : "任务配置"}
+                      </p>
                     </div>
-                  </div>
-                  <div className="filter-grid">
-                    <input
-                      className="text-input compact"
-                      value={taskSearch}
-                      placeholder="搜索名称、脚本、标签"
-                      onChange={(event) => setTaskSearch(event.currentTarget.value)}
-                    />
-                    <ChoiceField
-                      value={taskKindFilter}
-                      options={[
-                        { value: "all", label: "全部类型" },
-                        { value: "python_task", label: "Python" },
-                        { value: "command_task", label: "命令" },
-                      ]}
-                      onChange={(value) => setTaskKindFilter(value as "all" | TaskKind)}
-                    />
-                    <SafeToggle
-                      checked={favoritesOnly}
-                      label="仅收藏"
-                      onChange={setFavoritesOnly}
-                    />
-                  </div>
-                  <div
-                    className="task-list"
-                    data-scroll-owner="column"
-                    role="region"
-                    aria-label="可滚动任务列表"
-                    tabIndex={0}
-                  >
-                    {visibleTasks.map((task) => (
-                      <button
-                        key={task.id ?? task.name}
-                        className={`task-card ${task.id === selectedTaskId ? "selected" : ""}`}
-                        onClick={() => {
-                          if (taskDirty && !window.confirm("当前修改未保存，仍然切换吗？")) {
-                            return;
-                          }
-                          setSelectedTaskId(task.id);
-                        }}
-                      >
-                        <div className="task-card-top">
-                          <strong>{task.name || "未命名任务"}</strong>
-                          {task.favorite && <span className="favorite-star">★</span>}
-                        </div>
-                        <span className="task-kind-tag">
-                          {task.kind === "python_task" ? "Python" : "命令"}
-                        </span>
-                        <small className="task-card-detail">
-                          {task.kind === "python_task"
-                            ? task.python?.scriptPath || "未设置脚本路径"
-                            : task.command?.command || "未设置命令"}
-                        </small>
+                    <div className="panel-actions">
+                      <button className="ghost-button" disabled={!commandPreview} onClick={() => void handleCopyText("命令预览", commandPreview)}>复制命令</button>
+                      <button className="ghost-button" onClick={() => void handleOpenTaskWorkingDirectory()}>打开工作目录</button>
+                      {draftTask?.kind === "python_task" && (
+                        <button className="ghost-button" onClick={() => void handleRevealTaskScript()}>定位脚本</button>
+                      )}
+                      <button className="ghost-button danger" onClick={() => void handleDeleteTask()}>删除</button>
+                      <button className="secondary-button" disabled={!draftTask} onClick={() => void handleSaveTask()}>
+                        {isSavingTask ? "保存中..." : "保存任务"}
                       </button>
-                    ))}
-                    {visibleTasks.length === 0 && (
-                      <div className="empty-state">
-                        <p>没有匹配的任务。</p>
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="task-workbench-layout">
-                  <div
-                    className="task-config-column"
-                    data-scroll-region="task-config"
-                    role="region"
-                    aria-label="可滚动任务配置"
-                    tabIndex={0}
-                  >
-                  <div className="panel task-editor-panel">
-                    <div className="panel-header">
-                      <div>
-                        <h3>{draftTask?.name || "任务详情"}</h3>
-                        <p className="muted">
-                          {draftTask?.kind === "python_task"
-                            ? "结构化 Python 任务"
-                            : draftTask?.kind === "command_task"
-                              ? "原始命令任务"
-                              : "新建或选择一个任务"}
-                        </p>
-                      </div>
-                      <div className="panel-actions">
-                        <button
-                          className="ghost-button"
-                          disabled={!commandPreview}
-                          onClick={() => void handleCopyText("命令预览", commandPreview)}
-                        >
-                          复制命令
-                        </button>
-                        <button
-                          className="ghost-button"
-                          onClick={() => void handleOpenTaskWorkingDirectory()}
-                        >
-                          打开工作目录
-                        </button>
-                        {draftTask?.kind === "python_task" && (
-                          <button
-                            className="ghost-button"
-                            onClick={() => void handleRevealTaskScript()}
-                          >
-                            定位脚本
-                          </button>
-                        )}
-                        <button className="ghost-button" onClick={() => void handleDeleteTask()}>
-                          删除
-                        </button>
-                        <button
-                          className="secondary-button"
-                          disabled={!draftTask}
-                          onClick={() => void handleSaveTask()}
-                        >
-                          {isSavingTask ? "保存中..." : "保存任务"}
-                        </button>
-                      </div>
+                      <button className="ghost-button" onClick={closeEditModal}>✕</button>
                     </div>
-
+                  </div>
+                  <div className="task-edit-modal-body">
+                  <div className="panel task-editor-panel" style={{ boxShadow: "none", border: "none", padding: 0 }}>
                     {draftTask ? (
                       <div className="editor-grid">
                         <label className="field">
@@ -1927,727 +1513,10 @@ function App() {
 
                   </div>
 
-                  <div
-                    className="task-run-column"
-                    data-scroll-region="task-run"
-                    role="region"
-                    aria-label="可滚动任务运行"
-                    tabIndex={0}
-                  >
-                    <div className="panel runtime-panel">
-                      <div className="panel-header">
-                        <div>
-                          <h3>任务运行</h3>
-                          <p className="muted">填写本次运行参数，不会修改任务配置模板。</p>
-                        </div>
-                        <button
-                          className="primary-button"
-                          disabled={
-                            !draftTask ||
-                            isSavingTask ||
-                            runtimeValuesLoading ||
-                            missingRuntimeVariables.length > 0
-                          }
-                          onClick={() => void handleStartRun()}
-                        >
-                          {isSavingTask
-                            ? "保存中..."
-                            : "运行任务"}
-                        </button>
-                      </div>
-
-                      {runtimeValuesLoading ? (
-                        <div className="runtime-empty">正在读取上次运行参数...</div>
-                      ) : runtimeParameters.length > 0 ? (
-                        <RuntimeParameterFields
-                          parameters={runtimeParameters}
-                          values={runtimeValues}
-                          errors={runtimeValueErrors}
-                          onChange={handleRuntimeValueChange}
-                          onPickPath={(name, type, value) =>
-                            void chooseRuntimePath(name, type, value)
-                          }
-                          repeatParameterNames={(draftTask?.python?.argumentRules ?? [])
-                            .filter((rule) => rule.emission === "repeat")
-                            .map((rule) => rule.inputName)}
-                        />
-                      ) : (
-                        <div className="runtime-empty">
-                          当前任务没有动态参数，可直接运行。需要动态编号时，在模板中写入
-                          <code>{" {{video_id}} "}</code>或<code>{" {{book_id}} "}</code>。
-                        </div>
-                      )}
-
-                      {missingRuntimeVariables.length > 0 && (
-                        <div className="alert-banner warning">
-                          请检查：{missingRuntimeVariables.map((name) => (
-                            `${runtimeParameters.find((item) => item.name === name)?.label || name}（${runtimeValueErrors[name]}）`
-                          )).join("、")}
-                        </div>
-                      )}
-                      {runtimePreviewError && (
-                        <div className="alert-banner warning">{runtimePreviewError}</div>
-                      )}
-                      <div className="field runtime-preview-field">
-                        <span>本次运行命令</span>
-                        <pre className="command-preview">{commandPreview}</pre>
-                      </div>
-                    </div>
-
-                  <div className="panel terminal-panel">
-                    <div className="panel-header">
-                      <div>
-                        <h3>内置终端</h3>
-                        <p className="muted">任务输出始终在软件内显示，不弹系统终端。</p>
-                      </div>
-                      <div className="panel-actions">
-                        <button
-                          className="ghost-button"
-                          disabled={!activeTerminal?.stdout && !activeTerminal?.stderr}
-                          onClick={() =>
-                            void handleCopyText(
-                              "终端输出",
-                              `${activeTerminal?.stdout ?? ""}\n${activeTerminal?.stderr ?? ""}`,
-                            )
-                          }
-                        >
-                          复制输出
-                        </button>
-                        <button
-                          className="ghost-button"
-                          disabled={!activeTerminal}
-                          onClick={() =>
-                            setTerminalBuffers((current) => {
-                              if (!activeRunId || !current[activeRunId]) return current;
-                              return {
-                                ...current,
-                                [activeRunId]: {
-                                  ...current[activeRunId],
-                                  stdout: "",
-                                  stderr: "",
-                                },
-                              };
-                            })
-                          }
-                        >
-                          清空视图
-                        </button>
-                        <button
-                          className="secondary-button"
-                          disabled={!activeRunId || activeTerminal?.status !== "running"}
-                          onClick={() => void handleStopRun()}
-                        >
-                          {activeRunTaskName ? `停止「${activeRunTaskName}」` : "停止运行"}
-                        </button>
-                      </div>
-                    </div>
-                    {activeRunId ? (
-                      <>
-                        {taskTerminalRuns.length > 1 && (
-                          <div className="terminal-run-tabs" aria-label="当前任务运行实例">
-                            {taskTerminalRuns.slice(0, 8).map((run) => (
-                              <button
-                                type="button"
-                                className={`terminal-run-tab ${run.id === activeRunId ? "active" : ""}`}
-                                aria-pressed={run.id === activeRunId}
-                                key={run.id}
-                                onClick={() => selectTaskTerminalRun(run)}
-                              >
-                                {run.id.slice(0, 8)} · {run.status}
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                        <div className="terminal-meta">
-                          <span>Run ID: {activeRunId}</span>
-                          <span className={`status-pill ${activeTerminal?.status ?? "running"}`}>
-                            {activeTerminal?.status ?? "running"}
-                          </span>
-                          <span>退出码: {activeTerminal?.exitCode ?? "—"}</span>
-                          <span>耗时: {formatDuration(activeTerminal?.durationMs ?? null)}</span>
-                        </div>
-                        <div className="terminal-grid">
-                          <div>
-                            <h4>Stdout</h4>
-                            <TerminalOutputView
-                              stream="stdout"
-                              output={activeTerminal?.stdout ?? ""}
-                              emptyText="等待输出..."
-                            />
-                          </div>
-                          <div>
-                            <h4>
-                              {activeTerminal?.status === "finished"
-                                ? "进程信息（stderr）"
-                                : "错误与进程信息（stderr）"}
-                            </h4>
-                            <TerminalOutputView
-                              stream="stderr"
-                              output={activeTerminal?.stderr ?? ""}
-                              emptyText="暂无进程信息。"
-                            />
-                          </div>
-                        </div>
-                      </>
-                    ) : (
-                      <div className="empty-state">
-                        <p>当前任务还没有终端实例。保存任务后点击“运行任务”。</p>
-                      </div>
-                    )}
-                  </div>
                   </div>
                 </div>
-              </section>
             )}
 
-            {view === "runs" && (
-              <section className="runs-layout">
-                <div className="panel runs-list-panel">
-                  <div className="panel-header">
-                    <div>
-                      <h3>运行记录</h3>
-                      <p className="muted">按任务名、命令和状态搜索历史运行。</p>
-                    </div>
-                    <div className="panel-actions">
-                      <button className="ghost-button" onClick={() => void refreshRuns()}>
-                        刷新列表
-                      </button>
-                      <button
-                        className="ghost-button danger"
-                        disabled={
-                          isClearingRunHistory ||
-                          !runs.some((run) => run.status !== "running")
-                        }
-                        onClick={() => void handleClearRunHistory()}
-                      >
-                        {isClearingRunHistory ? "正在清除..." : "一键清除历史"}
-                      </button>
-                    </div>
-                  </div>
-                  <div className="filter-grid run-filter-grid">
-                    <input
-                      className="text-input compact"
-                      value={runSearch}
-                      placeholder="搜索任务、命令或目录"
-                      onChange={(event) => setRunSearch(event.currentTarget.value)}
-                    />
-                    <select
-                      className="text-input compact run-status-select"
-                      aria-label="运行状态筛选"
-                      value={runStatusFilter}
-                      onChange={(event) => setRunStatusFilter(event.currentTarget.value)}
-                    >
-                      <option value="all">全部状态</option>
-                      <option value="running">running</option>
-                      <option value="finished">finished</option>
-                      <option value="failed">failed</option>
-                      <option value="stopped">stopped</option>
-                      <option value="timed_out">timed_out</option>
-                      <option value="interrupted">interrupted</option>
-                    </select>
-                  </div>
-                  <div className="table-list">
-                    {visibleRuns.map((run) => (
-                      <button
-                        key={run.id}
-                        className={`table-row clickable ${selectedRunId === run.id ? "selected" : ""}`}
-                        onClick={() => setSelectedRunId(run.id)}
-                      >
-                        <span>{run.taskName || "已删除任务"}</span>
-                        <span className={`status-pill ${run.status}`}>{run.status}</span>
-                        <span>{formatDateTime(run.startedAt)}</span>
-                      </button>
-                    ))}
-                    {visibleRuns.length === 0 && <p className="muted">暂无匹配的运行记录。</p>}
-                  </div>
-                </div>
-
-                <div className="panel run-details-panel">
-                  <div className="panel-header">
-                    <div>
-                      <h3>{selectedRun?.taskName || "运行详情"}</h3>
-                      <p className="muted">查看命令快照、输出、耗时和退出码。</p>
-                    </div>
-                    {selectedRun && (
-                      <div className="panel-actions">
-                        <button
-                          className="ghost-button"
-                          onClick={() =>
-                            void handleCopyText("命令快照", selectedRun.commandPreview)
-                          }
-                        >
-                          复制命令
-                        </button>
-                        <button
-                          className="ghost-button"
-                          onClick={() =>
-                            void handleCopyText(
-                              "运行输出",
-                              `${selectedRunSnapshot?.stdout ?? ""}\n${selectedRunSnapshot?.stderr ?? ""}`,
-                            )
-                          }
-                        >
-                          复制输出
-                        </button>
-                        <button
-                          className="ghost-button"
-                          disabled={!selectedRun.taskId}
-                          onClick={() => void handleRerunSelectedTask()}
-                        >
-                          重跑任务
-                        </button>
-                        {selectedRun.status === "running" && (
-                          <button
-                            className="secondary-button"
-                            onClick={() =>
-                              void handleStopRun(selectedRun.id, selectedRun.taskName)
-                            }
-                          >
-                            停止此实例
-                          </button>
-                        )}
-                        <button
-                          className="ghost-button"
-                          onClick={() => void handleOpenSelectedRunDirectory()}
-                        >
-                          打开工作目录
-                        </button>
-                        <button
-                          className="ghost-button"
-                          onClick={() => void handleRevealRunLog("stdout")}
-                        >
-                          定位 Stdout
-                        </button>
-                        <button
-                          className="ghost-button"
-                          onClick={() => void handleRevealRunLog("stderr")}
-                        >
-                          定位 Stderr
-                        </button>
-                        <button
-                          className="secondary-button"
-                          onClick={() => selectTaskTerminalRun(selectedRun)}
-                        >
-                          在内置终端中查看
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                  {selectedRun ? (
-                    <>
-                      <div className="detail-grid">
-                        <div>
-                          <span>状态</span>
-                          <strong className={`status-pill ${selectedRun.status}`}>
-                            {selectedRun.status}
-                          </strong>
-                        </div>
-                        <div>
-                          <span>开始时间</span>
-                          <strong>{formatDateTime(selectedRun.startedAt)}</strong>
-                        </div>
-                        <div>
-                          <span>结束时间</span>
-                          <strong>{formatDateTime(selectedRun.finishedAt)}</strong>
-                        </div>
-                        <div>
-                          <span>耗时</span>
-                          <strong>{formatDuration(selectedRun.durationMs)}</strong>
-                        </div>
-                        <div>
-                          <span>退出码</span>
-                          <strong>{selectedRun.exitCode ?? "—"}</strong>
-                        </div>
-                        <div>
-                          <span>执行尝试</span>
-                          <strong>{selectedRun.attemptCount ?? 1}</strong>
-                        </div>
-                        <div>
-                          <span>终止原因</span>
-                          <strong>{selectedRun.terminationReason || "正常结束"}</strong>
-                        </div>
-                        <div>
-                          <span>工作目录</span>
-                          <strong>{selectedRun.workingDirectory || "自动推导"}</strong>
-                        </div>
-                      </div>
-                      <label className="field">
-                        <span>命令快照</span>
-                        <pre className="command-preview">{selectedRun.commandPreview}</pre>
-                      </label>
-                      <div className="terminal-grid run-record-terminal-grid">
-                        <div>
-                          <h4>Stdout</h4>
-                          <TerminalOutputView
-                            stream="stdout"
-                            output={runOutputLoading ? "加载中..." : selectedRunSnapshot?.stdout ?? ""}
-                            emptyText="暂无输出。"
-                          />
-                        </div>
-                        <div>
-                          <h4>
-                            {selectedRun?.status === "finished"
-                              ? "进程信息（stderr）"
-                              : "错误与进程信息（stderr）"}
-                          </h4>
-                          <TerminalOutputView
-                            stream="stderr"
-                            output={runOutputLoading ? "加载中..." : selectedRunSnapshot?.stderr ?? ""}
-                            emptyText="暂无进程信息。"
-                          />
-                        </div>
-                      </div>
-                    </>
-                  ) : (
-                    <div className="empty-state">
-                      <p>选择一条运行记录查看详情。</p>
-                    </div>
-                  )}
-                </div>
-              </section>
-            )}
-
-            {view === "settings" && (
-              <section className="settings-layout">
-                <div className="panel settings-card">
-                  <div className="panel-header">
-                    <div>
-                      <h3>全局设置</h3>
-                      <p className="muted">主题、默认解释器和运行行为。</p>
-                    </div>
-                    <button className="secondary-button" onClick={() => void handleSaveSettings()}>
-                      保存设置
-                    </button>
-                  </div>
-
-                  <label className="field">
-                    <span>主题</span>
-                    <ChoiceField
-                      value={settingsDraft.theme}
-                      options={[
-                        { value: "light", label: "浅色" },
-                        { value: "dark", label: "深色" },
-                      ]}
-                      onChange={(value) =>
-                        setSettingsDraft((current) => ({
-                          ...current,
-                          theme: value as ThemeMode,
-                        }))
-                      }
-                    />
-                  </label>
-
-                  <label className="field">
-                    <span>默认解释器</span>
-                    <ChoiceField
-                      value={settingsDraft.defaultInterpreterId ?? ""}
-                      options={[
-                        { value: "", label: "未设置" },
-                        ...interpreters.map((interpreter) => ({
-                          value: interpreter.id,
-                          label: interpreter.name,
-                        })),
-                      ]}
-                      onChange={(value) =>
-                        setSettingsDraft((current) => ({
-                          ...current,
-                          defaultInterpreterId: value || null,
-                        }))
-                      }
-                    />
-                  </label>
-
-                  <label className="field">
-                    <span>日志保留天数</span>
-                    <input
-                      className="text-input"
-                      type="number"
-                      min={1}
-                      value={settingsDraft.logRetentionDays}
-                      onChange={(event) =>
-                        setSettingsDraft((current) => ({
-                          ...current,
-                          logRetentionDays: Number(event.currentTarget.value) || 1,
-                        }))
-                      }
-                    />
-                  </label>
-
-                  <div className="field inline">
-                    <SafeToggle
-                      checked={settingsDraft.confirmBeforeStop}
-                      label="停止运行前确认"
-                      onChange={(next) =>
-                        setSettingsDraft((current) => ({
-                          ...current,
-                          confirmBeforeStop: next,
-                        }))
-                      }
-                    />
-                  </div>
-                </div>
-
-                <div className="panel settings-card">
-                  <div className="panel-header">
-                    <div>
-                      <h3>移动端连接</h3>
-                      <p className="muted">让手机通过局域网查看任务、运行日志并下载输出文件。</p>
-                    </div>
-                    <button
-                      className="secondary-button"
-                      disabled={mobileApiBusy}
-                      onClick={() => void handleSaveMobileApiSettings()}
-                    >
-                      {mobileApiBusy ? "保存中..." : "保存连接设置"}
-                    </button>
-                  </div>
-
-                  <div className="field inline">
-                    <SafeToggle
-                      checked={mobileApiDraft.enabled}
-                      label="启用移动端 API"
-                      onChange={(next) =>
-                        setMobileApiDraft((current) => ({
-                          ...current,
-                          enabled: next,
-                        }))
-                      }
-                    />
-                  </div>
-
-                  <div className="filter-grid">
-                    <label className="field">
-                      <span>监听地址</span>
-                      <SafeSingleLineInput
-                        value={mobileApiDraft.bindHost}
-                        onChange={(value) =>
-                          setMobileApiDraft((current) => ({
-                            ...current,
-                            bindHost: value,
-                          }))
-                        }
-                      />
-                    </label>
-                    <label className="field">
-                      <span>端口</span>
-                      <input
-                        className="text-input"
-                        type="number"
-                        min={1024}
-                        max={65535}
-                        value={mobileApiDraft.port}
-                        onChange={(event) =>
-                          setMobileApiDraft((current) => ({
-                            ...current,
-                            port: Number(event.currentTarget.value) || 17631,
-                          }))
-                        }
-                      />
-                    </label>
-                  </div>
-
-                  <div className="detail-grid">
-                    <div>
-                      <span>服务状态</span>
-                      <strong>{mobileApiStatus?.serverRunning ? "运行中" : "未运行"}</strong>
-                    </div>
-                    <div>
-                      <span>Token</span>
-                      <strong>{mobileApiStatus?.tokenConfigured ? "已配对" : "未配对"}</strong>
-                    </div>
-                  </div>
-
-                  <label className="field">
-                    <span>手机访问地址</span>
-                    <pre className="command-preview">
-                      {mobileApiStatus?.baseUrls.length
-                        ? mobileApiStatus.baseUrls.join("\n")
-                        : "启用后显示局域网访问地址"}
-                    </pre>
-                  </label>
-
-                  <label className="field">
-                    <span>配对码</span>
-                    <pre className="command-preview mobile-pairing-code">
-                      {mobileApiStatus?.pairingCode || "------"}
-                    </pre>
-                  </label>
-
-                  <div className="panel-actions">
-                    <button
-                      className="ghost-button"
-                      disabled={mobileApiBusy}
-                      onClick={() => void handleRegenerateMobilePairingCode()}
-                    >
-                      重置配对码
-                    </button>
-                    <span className="muted">{mobileApiStatus?.message ?? "移动端 API 未初始化"}</span>
-                  </div>
-                </div>
-
-                <div className="panel settings-card">
-                  <div className="panel-header">
-                    <div>
-                      <h3>Bundled Python</h3>
-                      <p className="muted">管理应用自带的 Python 运行时，用于正式分发和开箱即跑。</p>
-                    </div>
-                    <button
-                      className="ghost-button"
-                      disabled={bundledPythonBusy}
-                      onClick={() => void refreshBundledPythonStatus()}
-                    >
-                      刷新状态
-                    </button>
-                  </div>
-                  <div className="detail-grid">
-                    <div>
-                      <span>状态</span>
-                      <strong>{bundledPythonStatus?.available ? "可用" : "未安装"}</strong>
-                    </div>
-                    <div>
-                      <span>来源</span>
-                      <strong>{bundledPythonStatus?.source ?? "none"}</strong>
-                    </div>
-                    <div>
-                      <span>版本</span>
-                      <strong>{bundledPythonStatus?.version || "未检测"}</strong>
-                    </div>
-                  </div>
-                  <label className="field">
-                    <span>运行时目录</span>
-                    <pre className="command-preview">
-                      {bundledPythonStatus?.rootDir || "还没有 bundled Python 目录"}
-                    </pre>
-                  </label>
-                  <p className="muted">{bundledPythonStatus?.message || "尚未初始化 bundled Python"}</p>
-                  <div className="panel-actions">
-                    <button
-                      className="secondary-button"
-                      disabled={bundledPythonBusy || !preferredExternalInterpreter}
-                      onClick={() =>
-                        void handleInstallBundledPython(
-                          preferredExternalInterpreter?.executablePath,
-                        )
-                      }
-                    >
-                      {bundledPythonBusy ? "安装中..." : "从当前系统 Python 安装"}
-                    </button>
-                    <button
-                      className="ghost-button"
-                      disabled={bundledPythonBusy}
-                      onClick={() => void handleInstallBundledPython()}
-                    >
-                      从自定义 python.exe 安装
-                    </button>
-                  </div>
-                </div>
-
-                <div className="panel settings-card">
-                  <div className="panel-header">
-                    <div>
-                      <h3>解释器管理</h3>
-                      <p className="muted">内置 Python 和外部 Python/venv 都在这里管理。</p>
-                    </div>
-                  </div>
-
-                  <div className="inline-form">
-                    <input
-                      className="text-input"
-                      placeholder="解释器名称"
-                      value={newInterpreterName}
-                      onChange={(event) => setNewInterpreterName(event.currentTarget.value)}
-                    />
-                    <input
-                      className="text-input"
-                      placeholder="python.exe 路径"
-                      value={newInterpreterPath}
-                      onChange={(event) => setNewInterpreterPath(event.currentTarget.value)}
-                    />
-                    <button className="ghost-button" onClick={() => void chooseInterpreterPath()}>
-                      选择文件
-                    </button>
-                    <button
-                      className="secondary-button"
-                      disabled={!newInterpreterPath}
-                      onClick={() => void handleSaveInterpreter(false)}
-                    >
-                      新增解释器
-                    </button>
-                  </div>
-
-                  <div className="table-list">
-                    {interpreters.map((profile) => (
-                      <div key={profile.id} className="table-row static-row">
-                        <div className="row-main">
-                          <strong>{profile.name}</strong>
-                          <small>{profile.executablePath}</small>
-                        </div>
-                        <div className="row-meta">
-                          <span className="task-kind-tag">
-                            {profile.type === "bundled" ? "内置" : "外部"}
-                          </span>
-                          {profile.isDefault && <span className="favorite-star">默认</span>}
-                        </div>
-                        <div className="row-actions">
-                          <button
-                            className="ghost-button"
-                            onClick={() =>
-                              void handleSaveInterpreter(true, { ...profile, isDefault: true })
-                            }
-                          >
-                            设为默认
-                          </button>
-                          <button
-                            className="ghost-button"
-                            onClick={() => void handleCheckInterpreter(profile.id)}
-                          >
-                            健康检查
-                          </button>
-                          {profile.type !== "bundled" && (
-                            <button
-                              className="ghost-button danger"
-                              onClick={() => void handleDeleteInterpreter(profile.id)}
-                            >
-                              删除
-                            </button>
-                          )}
-                        </div>
-                        {selectedInterpreterHealth[profile.id] && (
-                          <div
-                            className={`health-pill ${selectedInterpreterHealth[profile.id].ok ? "ok" : "fail"}`}
-                          >
-                            {selectedInterpreterHealth[profile.id].message}
-                            {selectedInterpreterHealth[profile.id].version
-                              ? ` (${selectedInterpreterHealth[profile.id].version})`
-                              : ""}
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="panel settings-card">
-                  <div className="panel-header">
-                    <div>
-                      <h3>工作区备份</h3>
-                      <p className="muted">导出或恢复任务、解释器和全局设置。</p>
-                    </div>
-                  </div>
-                  <div className="panel-actions">
-                    <button
-                      className="secondary-button"
-                      onClick={() => void handleExportWorkspace()}
-                    >
-                      导出工作区 JSON
-                    </button>
-                    <button className="ghost-button" onClick={() => void handleImportWorkspace()}>
-                      导入工作区 JSON
-                    </button>
-                  </div>
-                </div>
-              </section>
-            )}
           </>
         )}
       </main>
@@ -2799,6 +1668,38 @@ function App() {
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {lanShareModalOpen && (
+        <LanShareModal
+          status={mobileApiStatus}
+          draft={mobileApiDraft}
+          busy={mobileApiBusy}
+          sharedFolders={sharedFolders}
+          sharedFolderBusy={sharedFolderBusy}
+          onDraftChange={(updater) => setMobileApiDraft((current) => updater(current))}
+          onSave={() => void handleSaveMobileApiSettings()}
+          onToggleEnabled={(enabled) => void handleToggleLanShare(enabled)}
+          onRegeneratePairingCode={() => void handleRegenerateMobilePairingCode()}
+          onAddSharedFolder={() => void handleAddSharedFolder()}
+          onRemoveSharedFolder={(id) => void handleRemoveSharedFolder(id)}
+          onCopy={(label, text) => void handleCopyText(label, text)}
+          onClose={() => setLanShareModalOpen(false)}
+        />
+      )}
+
+      {statusMessage && (
+        <div className="status-toast" role="status" aria-live="polite">
+          <span className="status-toast-text">{statusMessage}</span>
+          <button
+            className="status-toast-close"
+            onClick={() => setStatusMessage("")}
+            aria-label="关闭提示"
+            title="关闭提示"
+          >
+            ✕
+          </button>
         </div>
       )}
     </div>

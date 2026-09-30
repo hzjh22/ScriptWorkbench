@@ -108,6 +108,12 @@ export interface PythonTaskConfig {
   scanSnapshot?: ScriptScanPreview | null;
 }
 
+export interface ManagedScriptImport {
+  scriptPath: string;
+  sourcePath: string;
+  copiedFiles: string[];
+}
+
 export interface ScanGroup {
   id: string;
   label: string;
@@ -274,4 +280,10 @@ export interface MobileApiStatus extends MobileApiSettings {
   serverRunning: boolean;
   baseUrls: string[];
   message: string;
+}
+
+export interface SharedFolder {
+  id: string;
+  label: string;
+  path: string;
 }

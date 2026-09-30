@@ -62,6 +62,7 @@ export function RuntimeParameterFields({
       case "message_ids": return "例如 53,54,55；留空读取最近消息";
       case "history_limit": return "例如 20";
       case "proxy": return "例如 http://127.0.0.1:7897";
+      case "two_step_password_env": return "例如 TG_BACKUP_2FA_PASSWORD";
       default:
         if (parameter.type === "file") return "选择或输入文件路径";
         if (parameter.type === "directory") return "选择或输入目录路径";
@@ -69,11 +70,34 @@ export function RuntimeParameterFields({
     }
   }
 
+  function parameterLabel(parameter: RuntimeParameterDefinition): string {
+    const labels: Record<string, string> = {
+      qr_ascii: "二维码终端预览",
+      two_step_password_env: "二步验证密码环境变量名",
+      connect_timeout: "连接超时（秒）",
+      chunk_kb: "分块大小（KB）",
+      api_id: "API ID",
+      api_hash: "API Hash",
+      json_out: "JSON 输出文件",
+      dry_run: "仅解析不登录（Dry Run）",
+    };
+    return labels[parameter.name] ?? parameter.label ?? parameter.name;
+  }
+
+  function parameterDescription(parameter: RuntimeParameterDefinition): string | undefined {
+    const descriptions: Record<string, string> = {
+      qr_ascii: "软件内运行请保持 never；二维码请打开日志中的最新 QR image 文件后，用 Telegram「设置 → 设备 → 连接桌面设备」扫描。",
+      two_step_password_env: "这里只填写环境变量名，不填写密码本身；密码请在任务编辑器的「环境变量」中设置。",
+      proxy: "Telegram 网络代理，例如 http://127.0.0.1:7897。",
+    };
+    return descriptions[parameter.name] ?? parameter.description;
+  }
+
   function renderParameter(parameter: RuntimeParameterDefinition) {
     const rawValue = values[parameter.name] ?? parameter.defaultValue;
     const value = rawValue || resolvedValues[parameter.name] || "";
     const error = errors[parameter.name];
-    const label = parameter.label || parameter.name;
+    const label = parameterLabel(parameter);
     const readOnlyDerived = Boolean(parameter.derivedTemplate && parameter.allowOverride === false);
     return (
       <div
@@ -173,7 +197,7 @@ export function RuntimeParameterFields({
           />
         )}
 
-        {parameter.description && <small className="muted">{parameter.description}</small>}
+        {parameterDescription(parameter) && <small className="muted">{parameterDescription(parameter)}</small>}
         {parameter.derivedTemplate && parameter.allowOverride !== false && !rawValue && (
           <small className="muted">当前自动生成：{resolvedValues[parameter.name]}</small>
         )}

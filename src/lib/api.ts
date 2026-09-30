@@ -6,6 +6,7 @@ import {
   CommandImportResult,
   InterpreterHealth,
   InterpreterProfile,
+  ManagedScriptImport,
   MobileApiSettings,
   MobileApiStatus,
   RunOutput,
@@ -13,6 +14,7 @@ import {
   RuntimeValues,
   ScriptScanPreview,
   ScriptScanStatus,
+  SharedFolder,
   TaskRecord,
 } from "../types";
 
@@ -35,6 +37,8 @@ export const api = {
     argsTemplate,
     allowHelp,
   }),
+  importPythonScript: (sourcePath: string) =>
+    invoke<ManagedScriptImport>("import_python_script", { sourcePath }),
   checkScriptScanStatus: (
     scriptPath: string,
     interpreterProfileId: string,
@@ -78,6 +82,13 @@ export const api = {
     invoke<MobileApiStatus>("save_mobile_api_settings", { settings }),
   regenerateMobilePairingCode: () =>
     invoke<MobileApiStatus>("regenerate_mobile_pairing_code"),
+
+  listSharedFolders: () =>
+    invoke<SharedFolder[]>("list_shared_folders"),
+  addSharedFolder: (path: string, label?: string) =>
+    invoke<SharedFolder[]>("add_shared_folder", { path, label: label ?? null }),
+  removeSharedFolder: (id: string) =>
+    invoke<SharedFolder[]>("remove_shared_folder", { id }),
 
   getSettings: () => invoke<AppSettings>("get_settings"),
   saveSettings: (settings: AppSettings) =>

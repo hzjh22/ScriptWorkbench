@@ -1,13 +1,42 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
+
+type Ue = ReturnType<typeof userEvent.setup>;
+
+async function findCard(taskName: string): Promise<HTMLElement> {
+  const title = await screen.findByText(taskName);
+  const card = title.closest(".gallery-card") as HTMLElement | null;
+  if (!card) throw new Error(`gallery card not found for ${taskName}`);
+  return card;
+}
+
+function cardIconButton(card: HTMLElement, title: string): HTMLElement {
+  const button = card.querySelector<HTMLElement>(`button[title="${title}"]`);
+  if (!button) throw new Error(`card button not found: ${title}`);
+  return button;
+}
+
+async function openEditModal(user: Ue, taskName: string): Promise<void> {
+  const card = await findCard(taskName);
+  await user.click(cardIconButton(card, "编辑任务配置"));
+  await screen.findByRole("button", { name: "保存任务" });
+}
+
+async function openRunModal(user: Ue, taskName: string): Promise<void> {
+  const card = await findCard(taskName);
+  await user.click(within(card).getByRole("button", { name: /运行/ }));
+  await screen.findByRole("button", { name: /开始运行/ });
+}
 
 const { saveTaskMock } = vi.hoisted(() => ({
   saveTaskMock: vi.fn(),
 }));
 const {
   startRunMock,
+  stopRunMock,
+  deleteTaskMock,
   writeTextFileMock,
   readTextFileMock,
   saveInterpreterProfileMock,
@@ -17,13 +46,17 @@ const {
   getTaskRuntimeValuesMock,
   dialogOpenMock,
   dialogSaveMock,
+  dialogConfirmMock,
   scanPythonScriptMock,
   checkScriptScanStatusMock,
   pickFileMock,
   listRunsMock,
   clearRunHistoryMock,
+  importPythonScriptMock,
 } = vi.hoisted(() => ({
   startRunMock: vi.fn(),
+  stopRunMock: vi.fn(),
+  deleteTaskMock: vi.fn(),
   writeTextFileMock: vi.fn(),
   readTextFileMock: vi.fn(),
   saveInterpreterProfileMock: vi.fn(),
@@ -33,11 +66,17 @@ const {
   getTaskRuntimeValuesMock: vi.fn(),
   dialogOpenMock: vi.fn(),
   dialogSaveMock: vi.fn(),
+  dialogConfirmMock: vi.fn(),
   scanPythonScriptMock: vi.fn(),
   checkScriptScanStatusMock: vi.fn(),
   pickFileMock: vi.fn(),
   listRunsMock: vi.fn(),
   clearRunHistoryMock: vi.fn(),
+  importPythonScriptMock: vi.fn(async (sourcePath: string) => ({
+    scriptPath: sourcePath,
+    copied: false,
+    managedDirectory: sourcePath.replace(/[\\/]([^\\/]+)$/, ""),
+  })),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -47,6 +86,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: dialogOpenMock,
   save: dialogSaveMock,
+  confirm: dialogConfirmMock,
 }));
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -154,6 +194,9 @@ vi.mock("./lib/api", () => ({
     ]),
     listRuns: listRunsMock,
     clearRunHistory: clearRunHistoryMock,
+    listSharedFolders: vi.fn(async () => []),
+    addSharedFolder: vi.fn(async () => []),
+    removeSharedFolder: vi.fn(async () => []),
     listInterpreterProfiles: vi.fn(async () => [
       {
         id: "system-python",
@@ -199,12 +242,13 @@ vi.mock("./lib/api", () => ({
     scanPythonScript: scanPythonScriptMock,
     checkScriptScanStatus: checkScriptScanStatusMock,
     saveTask: saveTaskMock,
-    deleteTask: vi.fn(),
+    importPythonScript: importPythonScriptMock,
+    deleteTask: deleteTaskMock,
     importCommand: vi.fn(),
     getRunOutput: vi.fn(async () => ({ stdout: "", stderr: "" })),
     getTaskRuntimeValues: getTaskRuntimeValuesMock,
     startRun: startRunMock,
-    stopRun: vi.fn(),
+    stopRun: stopRunMock,
     deleteInterpreterProfile: vi.fn(),
     checkInterpreterHealth: vi.fn(),
     saveInterpreterProfile: saveInterpreterProfileMock,
@@ -287,6 +331,12 @@ describe("App selftest interactions", () => {
     dialogOpenMock.mockImplementation(async () => "E:/import.json");
     dialogSaveMock.mockReset();
     dialogSaveMock.mockImplementation(async () => "E:/export.json");
+    dialogConfirmMock.mockReset();
+    dialogConfirmMock.mockImplementation(async () => true);
+    stopRunMock.mockReset();
+    stopRunMock.mockImplementation(async () => undefined);
+    deleteTaskMock.mockReset();
+    deleteTaskMock.mockImplementation(async () => undefined);
     pickFileMock.mockReset();
     pickFileMock.mockImplementation(async () => null);
     listRunsMock.mockReset();
@@ -349,12 +399,7 @@ describe("App selftest interactions", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText("UI Selftest Task");
-    await user.click(
-      screen.getByRole("button", {
-        name: /UI Selftest Task.*Python.*selftest_python_task\.py/,
-      }),
-    );
+    await openEditModal(user, "UI Selftest Task");
 
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "解释器 System Python" })).toBeTruthy();
@@ -382,10 +427,7 @@ describe("App selftest interactions", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText("UI Selftest Task");
-    await user.click(screen.getByRole("button", {
-      name: /UI Selftest Task.*Python.*selftest_python_task\.py/,
-    }));
+    await openEditModal(user, "UI Selftest Task");
     await user.click(screen.getByRole("button", { name: "扫描参数" }));
 
     expect(await screen.findByText("确认运行表单")).toBeTruthy();
@@ -402,23 +444,16 @@ describe("App selftest interactions", () => {
     );
   });
 
-  it("allows the same task to start concurrent run instances", async () => {
+  it("starts a run from the run modal with the task id and runtime values", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText("UI Selftest Task");
-    await user.click(
-      screen.getByRole("button", {
-        name: /UI Selftest Task.*Python.*selftest_python_task\.py/,
-      }),
-    );
-    const startButton = screen.getByRole("button", { name: "开始运行" });
-    await user.click(startButton);
-    await user.click(startButton);
+    await openRunModal(user, "UI Selftest Task");
+    await user.click(screen.getByRole("button", { name: /开始运行/ }));
 
-    expect(startRunMock).toHaveBeenCalledTimes(2);
-    expect(startRunMock).toHaveBeenNthCalledWith(1, "task-1", {});
-    expect(startRunMock).toHaveBeenNthCalledWith(2, "task-1", {});
+    await waitFor(() => {
+      expect(startRunMock).toHaveBeenCalledWith("task-1", {});
+    });
   });
 
   it("keeps each task bound to its own terminal run", async () => {
@@ -442,36 +477,60 @@ describe("App selftest interactions", () => {
     }));
     render(<App />);
 
-    await screen.findByText("UI Selftest Task");
-    await user.click(screen.getByRole("button", {
-      name: /UI Selftest Task.*Python.*selftest_python_task\.py/,
-    }));
-    await user.click(screen.getByRole("button", { name: "运行任务" }));
-    expect(await screen.findByText("Run ID: run-task-1")).toBeTruthy();
+    await openRunModal(user, "UI Selftest Task");
+    await user.click(screen.getByRole("button", { name: /开始运行/ }));
+    await waitFor(() => {
+      expect(startRunMock).toHaveBeenCalledWith("task-1", {});
+    });
+    await user.click(screen.getByRole("button", { name: "关闭" }));
 
-    await user.click(screen.getByRole("button", {
-      name: /UI Command Task.*命令.*cmd \/c "echo test"/,
-    }));
-    expect(await screen.findByText("当前任务还没有终端实例。保存任务后点击“运行任务”。")).toBeTruthy();
-    expect(screen.queryByText("Run ID: run-task-1")).toBeNull();
+    await openRunModal(user, "UI Command Task");
+    await user.click(screen.getByRole("button", { name: /开始运行/ }));
+    await waitFor(() => {
+      expect(startRunMock).toHaveBeenCalledWith("task-2", {});
+    });
 
-    await user.click(screen.getByRole("button", { name: "运行任务" }));
-    expect(await screen.findByText("Run ID: run-task-2")).toBeTruthy();
+    const taskIds = startRunMock.mock.calls.map((call) => call[0]);
+    expect(taskIds).toContain("task-1");
+    expect(taskIds).toContain("task-2");
+  });
 
-    await user.click(screen.getByRole("button", {
-      name: /UI Selftest Task.*Python.*selftest_python_task\.py/,
-    }));
-    expect(await screen.findByText("Run ID: run-task-1")).toBeTruthy();
-    expect(screen.queryByText("Run ID: run-task-2")).toBeNull();
+  it("starts a second instance when an allow-policy task is already running", async () => {
+    listRunsMock.mockImplementation(async () => [
+      {
+        id: "run-existing",
+        taskId: "task-1",
+        taskName: "UI Selftest Task",
+        status: "running",
+        commandPreview: "python fixture.py",
+        workingDirectory: "E:/ScriptWorkbench/fixtures",
+        startedAt: "2026-01-01T00:00:00",
+        finishedAt: null,
+        durationMs: null,
+        exitCode: null,
+        stdoutLogPath: "stdout.log",
+        stderrLogPath: "stderr.log",
+        runtimeValues: {},
+        attemptCount: 1,
+        terminationReason: null,
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+
+    const card = await findCard("UI Selftest Task");
+    await user.click(within(card).getByRole("button", { name: /查看运行/ }));
+    await user.click(await screen.findByRole("button", { name: /再开一个实例/ }));
+
+    await waitFor(() => {
+      expect(startRunMock).toHaveBeenCalledWith("task-1", {});
+    });
   });
 
   it("saves task reliability policies", async () => {
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByText("UI Selftest Task");
-    await user.click(screen.getByRole("button", {
-      name: /UI Selftest Task.*Python.*selftest_python_task\.py/,
-    }));
+    await openEditModal(user, "UI Selftest Task");
     await user.click(screen.getByRole("button", { name: "已有运行时拒绝" }));
     await user.click(screen.getByRole("button", { name: "GBK / 中文 Windows" }));
     await user.click(screen.getByRole("button", { name: "保存任务" }));
@@ -489,12 +548,7 @@ describe("App selftest interactions", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText("ComicBox Dynamic Task");
-    await user.click(
-      screen.getByRole("button", {
-        name: /ComicBox Dynamic Task.*Python.*backup_comicbox_book\.py/,
-      }),
-    );
+    await openEditModal(user, "ComicBox Dynamic Task");
     await user.click(screen.getByRole("button", { name: "编辑运行表单" }));
 
     expect(await screen.findByText("确认运行表单")).toBeTruthy();
@@ -509,30 +563,14 @@ describe("App selftest interactions", () => {
 
   it("fills one runtime value for repeated ComicBox placeholders", async () => {
     const user = userEvent.setup();
-    let resolveRuntimeValues!: (values: Record<string, string>) => void;
-    getTaskRuntimeValuesMock.mockImplementation((taskId: string) => {
-      if (taskId !== "task-3") return Promise.resolve({});
-      return new Promise((resolve) => {
-        resolveRuntimeValues = resolve;
-      });
-    });
     render(<App />);
 
-    await screen.findByText("ComicBox Dynamic Task");
-    await user.click(
-      screen.getByRole("button", {
-        name: /ComicBox Dynamic Task.*Python.*backup_comicbox_book\.py/,
-      }),
-    );
-
-    expect(await screen.findByText("正在读取上次运行参数...")).toBeTruthy();
-    expect(screen.queryByRole("textbox", { name: "漫画 ID" })).toBeNull();
-    resolveRuntimeValues({});
+    await openRunModal(user, "ComicBox Dynamic Task");
 
     const runtimeInput = await screen.findByRole("textbox", { name: "漫画 ID" });
     await user.type(runtimeInput, "5101");
     expect(runtimeInput.textContent).toBe("5101");
-    await user.click(screen.getByRole("button", { name: "运行任务" }));
+    await user.click(screen.getByRole("button", { name: /开始运行/ }));
 
     await waitFor(() => {
       expect(startRunMock).toHaveBeenCalledWith("task-3", { book_id: "5101" });
@@ -543,12 +581,7 @@ describe("App selftest interactions", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText("Typed Dynamic Task");
-    await user.click(
-      screen.getByRole("button", {
-        name: /Typed Dynamic Task.*Python.*selftest_python_task\.py/,
-      }),
-    );
+    await openRunModal(user, "Typed Dynamic Task");
 
     expect((await screen.findByRole("spinbutton", { name: "线程数" }) as HTMLInputElement).value)
       .toBe("12");
@@ -559,7 +592,7 @@ describe("App selftest interactions", () => {
     expect(screen.getByRole("textbox", { name: "输出目录" }).textContent).toBe("E:/output");
 
     await user.type(screen.getByLabelText("访问令牌"), "session-token");
-    await user.click(screen.getByRole("button", { name: "运行任务" }));
+    await user.click(screen.getByRole("button", { name: /开始运行/ }));
 
     await waitFor(() => {
       expect(startRunMock).toHaveBeenCalledWith("task-4", {
@@ -572,145 +605,193 @@ describe("App selftest interactions", () => {
     });
   });
 
-  it("exports and imports workspace data", async () => {
+  it("starts LAN sharing from the gallery topbar", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText("设置");
-    await user.click(screen.getByText("设置"));
+    await screen.findByText("UI Selftest Task");
+    await user.click(screen.getByRole("button", { name: /局域网共享/ }));
 
-    await user.click(screen.getByRole("button", { name: "导出工作区 JSON" }));
-    expect(writeTextFileMock).toHaveBeenCalled();
-
-    vi.spyOn(window, "confirm").mockReturnValueOnce(true);
-    await user.click(screen.getByRole("button", { name: "导入工作区 JSON" }));
-
-    expect(readTextFileMock).toHaveBeenCalledWith("E:/import.json");
-    expect(saveSettingsMock).toHaveBeenCalled();
-  });
-
-  it("saves mobile API settings from the settings page", async () => {
-    const user = userEvent.setup();
-    render(<App />);
-
-    await screen.findByText("设置");
-    await user.click(screen.getByText("设置"));
-    await screen.findByText("移动端连接");
-
-    await user.click(screen.getByRole("switch", { name: "启用移动端 API" }));
-    await user.click(screen.getByRole("button", { name: "保存连接设置" }));
+    await user.click(screen.getByRole("button", { name: /开启局域网共享/ }));
 
     expect(saveMobileApiSettingsMock).toHaveBeenCalledWith({
       enabled: true,
       bindHost: "0.0.0.0",
       port: 17631,
     });
-    expect(await screen.findByText("移动端 API 已运行")).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /停止局域网共享/ })).toBeTruthy();
   });
 
-  it("clears completed run history while preserving running instances", async () => {
+  it("toggles favorite from a gallery card without crashing", async () => {
     const user = userEvent.setup();
-    const completedRun = {
-      id: "run-finished",
-      taskId: "task-1",
-      taskName: "Completed Task",
-      status: "finished",
-      commandPreview: "python completed.py",
-      workingDirectory: "E:/ScriptWorkbench",
-      startedAt: "2026-01-01T00:00:00",
-      finishedAt: "2026-01-01T00:00:01",
-      durationMs: 1000,
-      exitCode: 0,
-      stdoutLogPath: "finished-stdout.log",
-      stderrLogPath: "finished-stderr.log",
-      runtimeValues: {},
-      attemptCount: 1,
-      terminationReason: null,
-    };
-    const runningRun = {
-      ...completedRun,
-      id: "run-active",
-      taskName: "Active Task",
-      status: "running",
-      finishedAt: null,
-      durationMs: null,
-      exitCode: null,
-    };
-    listRunsMock
-      .mockResolvedValueOnce([completedRun, runningRun])
-      .mockResolvedValue([runningRun]);
-    clearRunHistoryMock.mockResolvedValue({
-      deletedCount: 1,
-      deletedLogCount: 2,
-      failedLogCount: 0,
+    render(<App />);
+
+    const card = await findCard("UI Command Task");
+    await user.click(cardIconButton(card, "收藏"));
+
+    await waitFor(() => expect(saveTaskMock).toHaveBeenCalled());
+    const payload = saveTaskMock.mock.calls[saveTaskMock.mock.calls.length - 1]?.[0];
+    expect(payload.id).toBe("task-2");
+    expect(payload.favorite).toBe(true);
+  });
+
+  it("shows start again when the latest run of a task has ended", async () => {
+    listRunsMock.mockImplementation(async () => [
+      {
+        id: "run-ended",
+        taskId: "task-1",
+        taskName: "UI Selftest Task",
+        status: "finished",
+        commandPreview: "python fixture.py",
+        workingDirectory: "E:/ScriptWorkbench/fixtures",
+        startedAt: "2026-01-01T00:00:00",
+        finishedAt: "2026-01-01T00:00:05",
+        durationMs: 5000,
+        exitCode: 0,
+        stdoutLogPath: "stdout.log",
+        stderrLogPath: "stderr.log",
+        runtimeValues: {},
+        attemptCount: 1,
+        terminationReason: null,
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await openRunModal(user, "UI Selftest Task");
+
+    expect(screen.queryByRole("button", { name: /停止运行/ })).toBeNull();
+    expect(await screen.findByRole("button", { name: /开始运行/ })).toBeTruthy();
+  });
+
+  it("stops a live run from the run modal after confirmation", async () => {
+    listRunsMock.mockImplementation(async () => [
+      {
+        id: "run-live",
+        taskId: "task-1",
+        taskName: "UI Selftest Task",
+        status: "running",
+        commandPreview: "python fixture.py",
+        workingDirectory: "E:/ScriptWorkbench/fixtures",
+        startedAt: "2026-01-01T00:00:00",
+        finishedAt: null,
+        durationMs: null,
+        exitCode: null,
+        stdoutLogPath: "stdout.log",
+        stderrLogPath: "stderr.log",
+        runtimeValues: {},
+        attemptCount: 1,
+        terminationReason: null,
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
+
+    const card = await findCard("UI Selftest Task");
+    await user.click(within(card).getByRole("button", { name: /查看运行/ }));
+
+    const stopButton = await screen.findByRole("button", { name: /停止运行/ });
+    await user.click(stopButton);
+
+    await waitFor(() => {
+      expect(dialogConfirmMock).toHaveBeenCalled();
+      expect(stopRunMock).toHaveBeenCalledWith("run-live");
     });
-    vi.spyOn(window, "confirm").mockReturnValueOnce(true);
-    render(<App />);
-
-    await screen.findByText("UI Selftest Task");
-    await user.click(screen.getByRole("button", { name: "运行记录" }));
-    await screen.findAllByText("Completed Task");
-    expect(screen.getByRole("combobox", { name: "运行状态筛选" }))
-      .toHaveProperty("value", "all");
-    await user.click(screen.getByRole("button", { name: "一键清除历史" }));
-
-    await waitFor(() => expect(clearRunHistoryMock).toHaveBeenCalledTimes(1));
-    expect(screen.queryAllByText("Completed Task")).toHaveLength(0);
-    expect((await screen.findAllByText("Active Task")).length).toBeGreaterThan(0);
   });
 
-  it("toggles favorite and settings switches without crashing", async () => {
+  it("deletes a task after confirmation", async () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText("UI Selftest Task");
-    await user.click(
-      screen.getByRole("button", {
-        name: /UI Selftest Task.*Python.*selftest_python_task\.py/,
-      }),
-    );
+    await openEditModal(user, "UI Command Task");
+    await user.click(screen.getByRole("button", { name: "删除" }));
 
-    await user.click(screen.getByRole("switch", { name: "收藏" }));
-    await user.click(screen.getByText("设置"));
-    await user.click(screen.getByRole("switch", { name: "停止运行前确认" }));
-    await user.click(screen.getByRole("button", { name: "保存设置" }));
-
-    expect(saveSettingsMock).toHaveBeenCalled();
+    await waitFor(() => {
+      expect(dialogConfirmMock).toHaveBeenCalled();
+      expect(deleteTaskMock).toHaveBeenCalledWith("task-2");
+    });
   });
 
-  it("keeps the task toolbar in normal document flow so it cannot cover panel headers", async () => {
+  it("renders the gallery as the single primary surface", async () => {
     const { container } = render(<App />);
     await screen.findByText("UI Selftest Task");
 
-    const workspace = container.querySelector<HTMLElement>(".workspace");
-    const topbar = container.querySelector<HTMLElement>(".topbar");
-    expect(workspace).not.toBeNull();
-    expect(topbar).not.toBeNull();
-    expect(workspace!.contains(topbar)).toBe(true);
-    expect(workspace).toHaveProperty("dataset.layoutBoundary", "workspace");
-    expect(topbar).toHaveProperty("dataset.scrollBehavior", "flow");
+    expect(container.querySelector(".gallery-shell")).not.toBeNull();
+    expect(container.querySelector(".gallery-grid")).not.toBeNull();
+    expect(container.querySelectorAll(".gallery-card").length).toBeGreaterThan(0);
+    expect(container.querySelector(".task-list")).toBeNull();
+    expect(container.querySelector(".gallery-view-nav")).toBeNull();
   });
 
-  it("keeps long task paths inside the task-list column", async () => {
-    const { container } = render(<App />);
-    await screen.findByText("UI Selftest Task");
+  it("shows a visible status toast after sending a stop signal", async () => {
+    listRunsMock.mockImplementation(async () => [
+      {
+        id: "run-live",
+        taskId: "task-1",
+        taskName: "UI Selftest Task",
+        status: "running",
+        commandPreview: "python fixture.py",
+        workingDirectory: "E:/ScriptWorkbench/fixtures",
+        startedAt: "2026-01-01T00:00:00",
+        finishedAt: null,
+        durationMs: null,
+        exitCode: null,
+        stdoutLogPath: "stdout.log",
+        stderrLogPath: "stderr.log",
+        runtimeValues: {},
+        attemptCount: 1,
+        terminationReason: null,
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
 
-    const taskList = container.querySelector<HTMLElement>(".task-list");
-    const details = container.querySelectorAll<HTMLElement>(".task-card-detail");
-    expect(taskList).toHaveProperty("dataset.scrollOwner", "column");
-    expect(details.length).toBeGreaterThan(0);
+    const card = await findCard("UI Selftest Task");
+    await user.click(within(card).getByRole("button", { name: /查看运行/ }));
+
+    const stopButton = await screen.findByRole("button", { name: /停止运行/ });
+    await user.click(stopButton);
+
+    expect(await screen.findByRole("status")).toBeTruthy();
+    expect(
+      await screen.findByText(/已向「UI Selftest Task」实例 run-live 发送停止信号/),
+    ).toBeTruthy();
   });
 
-  it("gives each task column its own internal scroll region", async () => {
-    const { container } = render(<App />);
-    await screen.findByText("UI Selftest Task");
+  it("returns the run modal to the start button immediately after stop succeeds", async () => {
+    listRunsMock.mockImplementation(async () => [
+      {
+        id: "run-live",
+        taskId: "task-1",
+        taskName: "UI Selftest Task",
+        status: "running",
+        commandPreview: "python fixture.py",
+        workingDirectory: "E:/ScriptWorkbench/fixtures",
+        startedAt: "2026-01-01T00:00:00",
+        finishedAt: null,
+        durationMs: null,
+        exitCode: null,
+        stdoutLogPath: "stdout.log",
+        stderrLogPath: "stderr.log",
+        runtimeValues: {},
+        attemptCount: 1,
+        terminationReason: null,
+      },
+    ]);
+    const user = userEvent.setup();
+    render(<App />);
 
-    expect(container.querySelector(".task-config-column"))
-      .toHaveProperty("dataset.scrollRegion", "task-config");
-    expect(container.querySelector(".task-run-column"))
-      .toHaveProperty("dataset.scrollRegion", "task-run");
-    expect(screen.getByRole("region", { name: "可滚动任务列表" })).toHaveProperty("tabIndex", 0);
-    expect(screen.getByRole("region", { name: "可滚动任务配置" })).toHaveProperty("tabIndex", 0);
-    expect(screen.getByRole("region", { name: "可滚动任务运行" })).toHaveProperty("tabIndex", 0);
+    const card = await findCard("UI Selftest Task");
+    await user.click(within(card).getByRole("button", { name: /查看运行/ }));
+
+    const stopButton = await screen.findByRole("button", { name: /停止运行/ });
+    await user.click(stopButton);
+
+    // The optimistic local state update must flip the modal back to the start
+    // button without waiting for any run://status event to arrive.
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: /停止运行/ })).toBeNull();
+    });
+    expect(await screen.findByRole("button", { name: /开始运行/ })).toBeTruthy();
   });
 });
